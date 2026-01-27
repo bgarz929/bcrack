@@ -247,9 +247,17 @@ def check_balances_multiprocess(address_batch):
         # Pilih server secara acak
         server = random.choice(ELECTRUM_SERVERS)
         
-        # Jalankan async function dalam event loop baru
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        # PERBAIKAN: Gunakan cara yang lebih aman untuk mendapatkan/membuat event loop
+        try:
+            loop = asyncio.get_running_loop()
+            # Jika loop sedang berjalan, kita tidak bisa menggunakannya di thread berbeda
+            # Buat loop baru
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        except RuntimeError:
+            # Tidak ada loop yang berjalan, buat baru
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
         
         results = loop.run_until_complete(check_balances_batch(address_batch, server))
         loop.close()
@@ -270,14 +278,20 @@ def check_balance_simple(address):
             # Gunakan Electrum API
             server = random.choice(ELECTRUM_SERVERS)
             
-            # Buat event loop untuk thread ini
+            # PERBAIKAN: Gunakan cara yang lebih aman untuk mendapatkan event loop
             try:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
+                # Loop sedang berjalan, kita perlu menjalankan task secara async
+                # Tapi karena kita di thread yang berbeda, lebih baik buat loop baru
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
             except RuntimeError:
+                # Tidak ada loop yang berjalan
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
             
             balance = loop.run_until_complete(check_balance_electrum(address, server))
+            loop.close()
             return balance
         except Exception as e:
             log_message(f"Electrum check failed for {address}: {e}, falling back...", "WARNING")
@@ -309,13 +323,17 @@ def check_balance_multiple(address):
         try:
             server = random.choice(ELECTRUM_SERVERS)
             
+            # PERBAIKAN: Gunakan cara yang aman untuk event loop
             try:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
             except RuntimeError:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
             
             balance = loop.run_until_complete(check_balance_electrum(address, server))
+            loop.close()
             if balance > 0:
                 return balance
         except:
@@ -410,6 +428,7 @@ class ElectrumBalanceChecker:
     def _check_chunk_sync(self, addresses, server_info):
         """Synchronous wrapper untuk async function"""
         try:
+            # PERBAIKAN: Selalu buat event loop baru untuk thread
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             
@@ -595,6 +614,27 @@ def save_wallet_result(result):
         log_message(f"Error saving wallet: {e}", "ERROR")
         return False
 
+# ========== HELPER FUNCTION UNTUK ASYNC ==========
+def get_or_create_event_loop():
+    """Helper function untuk mendapatkan atau membuat event loop dengan aman"""
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        # Tidak ada loop yang berjalan, buat baru
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
+
+def run_async_in_thread(coro):
+    """Jalankan coroutine di thread saat ini"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        result = loop.run_until_complete(coro)
+        return result
+    finally:
+        loop.close()
+
 # ========== DISPLAY PROGRESS ==========
 def display_progress(stats, start_time):
     """Display progress bar dan statistik real-time"""
@@ -646,7 +686,7 @@ def print_banner():
 ║  ██   ██ ██   ██    ██    ██      ██   ██ ██ ██  ██ ██ ██   ██  ║
 ║  ██████  ██   ██    ██    ██      ██   ██ ██ ██   ████ ██████   ║
 ║                                                                  ║
-║               BITCOIN WALLET SCANNER v2.1                        ║
+║               BITCOIN WALLET SCANNER v2.2                        ║
 ║           Multithreaded + Fast Electrum Balance Check            ║
 ║               Author: MMDRZA.COM                                 ║
 ║                                                                  ║
