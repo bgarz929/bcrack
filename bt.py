@@ -130,7 +130,6 @@ def pub_key_to_addr(pubkey_hex):
             pseudo_ripemd = double_hash[:20]
             return base58_check_encode(b"\0", pseudo_ripemd)
         except Exception as e:
-            log_message(f"Address generation failed: {e}", "ERROR")
             return "1ErrorAddress"
 
 # ========== ELECTRUM UTILITIES (FIXED) ==========
@@ -216,16 +215,14 @@ def get_healthy_servers_sync():
     
     # Jika cache expired atau kosong, fetch baru
     if main_event_loop is None:
-        # Buat event loop jika belum ada
-        try:
-            main_event_loop = asyncio.get_event_loop()
-        except RuntimeError:
-            main_event_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(main_event_loop)
+        return []  # Event loop belum diinisialisasi
     
     try:
         # Jalankan di main event loop
-        healthy_servers = main_event_loop.run_until_complete(get_healthy_servers_async())
+        healthy_servers = asyncio.run_coroutine_threadsafe(
+            get_healthy_servers_async(),
+            main_event_loop
+        ).result(timeout=10)
         
         with cache_lock:
             server_cache = healthy_servers.copy()
@@ -328,7 +325,6 @@ def generate_wallet(key_number):
         return result
         
     except Exception as e:
-        log_message(f"Error generating wallet for {key_number}: {e}", "ERROR")
         return None
 
 def process_batch(batch_numbers):
@@ -344,7 +340,6 @@ def process_batch(batch_numbers):
                 if result:
                     results.append(result)
             except Exception as e:
-                num = futures[future]
                 continue  # Skip error, continue
     
     return results
@@ -441,7 +436,7 @@ def print_banner():
 ║  ██   ██ ██   ██    ██    ██      ██   ██ ██ ██  ██ ██ ██   ██  ║
 ║  ██████  ██   ██    ██    ██      ██   ██ ██ ██   ████ ██████   ║
 ║                                                                  ║
-║               BITCOIN WALLET SCANNER v3.0                        ║
+║               BITCOIN WALLET SCANNER v3.1                        ║
 ║           FIXED Event Loop Management                            ║
 ║               Author: MMDRZA.COM                                 ║
 ║                                                                  ║
@@ -471,12 +466,25 @@ def initialize():
     
     log_message("Initializing...", "INFO")
     
-    # Setup event loop
+    # Setup event loop dengan cara yang benar
     try:
-        main_event_loop = asyncio.get_event_loop()
+        # Coba dapatkan running loop
+        main_event_loop = asyncio.get_running_loop()
     except RuntimeError:
+        # Jika tidak ada, buat baru
         main_event_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(main_event_loop)
+    
+    # Start event loop thread
+    def run_event_loop():
+        asyncio.set_event_loop(main_event_loop)
+        main_event_loop.run_forever()
+    
+    event_loop_thread = threading.Thread(target=run_event_loop, daemon=True)
+    event_loop_thread.start()
+    
+    # Tunggu event loop ready
+    time.sleep(1)
     
     # Health check servers
     if CHECK_BALANCE:
@@ -519,7 +527,6 @@ def main_scanner():
             batch_numbers = [random.randint(1, 10**30) for _ in range(BATCH_SIZE)]
             
             # Process batch
-            log_message(f"Processing batch {batch_counter}...", "INFO")
             batch_start = time.time()
             batch_results = process_batch(batch_numbers)
             batch_time = time.time() - batch_start
@@ -545,7 +552,7 @@ def main_scanner():
             display_progress(stats, stats['start_time'], batch_counter)
             
             # Log batch info
-            if batch_counter % 5 == 0:
+            if batch_counter % 5 == 0 or batch_time > 30:
                 elapsed = time.time() - stats['start_time']
                 keys_per_sec = stats['processed'] / elapsed if elapsed > 0 else 0
                 
@@ -590,9 +597,9 @@ def main():
         final_stats = {'processed': 0, 'rich_found': 0, 'start_time': time.time()}
     
     finally:
-        # Cleanup
-        if main_event_loop:
-            main_event_loop.run_until_complete(asyncio.sleep(0.1))
+        # Stop event loop
+        if main_event_loop and main_event_loop.is_running():
+            main_event_loop.call_soon_threadsafe(main_event_loop.stop)
         
         # Final stats
         print("\n" + "=" * 70)
