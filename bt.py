@@ -5,13 +5,12 @@ import random
 import threading
 import hashlib
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from binascii import hexlify, unhexlify
 from struct import Struct
 import asyncio
 import base58
 import bech32
-import multiprocessing
 import ssl
 from aiorpcx import connect_rs
 import socket
@@ -23,9 +22,6 @@ MAX_THREADS = 12                    # Jumlah thread untuk multithreading
 BATCH_SIZE = 5000                   # Ukuran batch processing
 CHECK_BALANCE = True               # Aktifkan pengecekan balance
 SAVE_INTERVAL = 1000               # Simpan progress setiap 1000 wallet
-USE_ELECTRUM_API = True            # Gunakan Electrum API yang lebih cepat
-ELECTRUM_MAX_CONCURRENT = 8        # Koneksi concurrent ke Electrum
-USE_MULTIPROCESSING = False        # Nonaktifkan multiprocessing karena kompleks
 MAX_RETRIES = 2                    # Maksimal retry untuk koneksi Electrum
 CONNECTION_TIMEOUT = 8             # Timeout koneksi Electrum (detik)
 
@@ -40,21 +36,21 @@ RICH_WALLETS_FILE = "rich_wallets.txt"  # Wallet dengan balance
 LOG_FILE = "scan.log"               # File log aktivitas
 PROGRESS_FILE = "progress.txt"      # Progress checkpoint
 
-# ========== ELECTRUM SERVER LIST (DIPERBARUI) ==========
+# ========== ELECTRUM SERVER LIST (FIXED - TIDAK PERLU PRIORITY) ==========
 ELECTRUM_SERVERS = [
-    {"host": "electrumx-core.1209k.com", "port": 50002, "protocol": "ssl", "priority": 1},
-    {"host": "bitcoin.aranguren.org", "port": 50002, "protocol": "ssl", "priority": 1},
-    {"host": "electrum.loyce.club", "port": 50002, "protocol": "ssl", "priority": 1},
-    {"host": "fulcrum.slicksparks.ky", "port": 50002, "protocol": "ssl", "priority": 1},
-    {"host": "electrum.kampfschnitzel.at", "port": 50002, "protocol": "ssl", "priority": 2},
-    {"host": "electrum.sare.red", "port": 50002, "protocol": "ssl", "priority": 2},
-    {"host": "blackie.c3-soft.com", "port": 57002, "protocol": "ssl", "priority": 2},
-    {"host": "fulcrum2.not.fyi", "port": 51002, "protocol": "ssl", "priority": 2},
-    {"host": "electrum.cakewallet.com", "port": 50002, "protocol": "ssl", "priority": 3},
-    {"host": "molten.tranquille.cc", "port": 50002, "protocol": "ssl", "priority": 3},
-    {"host": "clownshow.fiatfaucet.com", "port": 50002, "protocol": "ssl", "priority": 3},
-    {"host": "btc.electroncash.dk", "port": 60002, "protocol": "ssl", "priority": 3},
+    {"host": "electrum.kampfschnitzel.at", "port": 50002},
+    {"host": "blackie.c3-soft.com", "port": 57002},
+    {"host": "fulcrum2.not.fyi", "port": 51002},
+    {"host": "bitcoin.aranguren.org", "port": 50002},
+    {"host": "electrum.loyce.club", "port": 50002},
 ]
+
+# ========== SHARED GLOBAL STATE ==========
+# Shared healthy servers list (diakses oleh semua thread)
+healthy_servers = []
+healthy_servers_lock = threading.Lock()
+last_health_check = 0
+HEALTH_CHECK_INTERVAL = 1800  # 30 menit (1800 detik)
 
 # ========== FUNGSI UTILITAS ==========
 def log_message(message, level="INFO"):
@@ -199,86 +195,88 @@ def create_ssl_context():
     ssl_context.set_ciphers('DEFAULT@SECLEVEL=1')
     return ssl_context
 
-async def check_server_health(server_info):
-    """Cek kesehatan server Electrum"""
+async def check_server_health_simple(server_info):
+    """Cek kesehatan server Electrum secara sederhana"""
     try:
         ssl_context = create_ssl_context()
-        # Gunakan asyncio.wait_for untuk timeout, bukan parameter di connect_rs
         async with connect_rs(
             server_info["host"], 
             server_info["port"], 
             ssl=ssl_context
         ) as session:
-            # Test connection dengan timeout
-            try:
-                version = await asyncio.wait_for(
-                    session.send_request("server.version", ["electrum-client", "1.4"]),
-                    timeout=CONNECTION_TIMEOUT
-                )
-                if version:
-                    return True
-            except asyncio.TimeoutError:
-                return False
-    except (ConnectionError, socket.error, OSError) as e:
-        # Jangan log error untuk setiap server yang gagal, terlalu banyak spam
+            # Test connection dengan timeout singkat
+            version = await asyncio.wait_for(
+                session.send_request("server.version", ["electrum-client", "1.4"]),
+                timeout=5
+            )
+            return version is not None
+    except:
         return False
-    except Exception as e:
-        return False
-    return False
 
-async def get_healthy_servers():
-    """Dapatkan server yang sehat"""
-    healthy_servers = []
+async def perform_health_check():
+    """Lakukan health check sekali saja"""
+    global healthy_servers, last_health_check
     
-    log_message("Memeriksa kesehatan server Electrum...", "INFO")
+    log_message("Performing Electrum server health check...", "INFO")
     
-    # Coba server dengan priority tinggi dulu
-    priority_servers = [s for s in ELECTRUM_SERVERS if s.get("priority", 3) <= 2]
-    other_servers = [s for s in ELECTRUM_SERVERS if s.get("priority", 3) > 2]
-    
-    # Cek server priority tinggi
     tasks = []
-    for server in priority_servers:
-        task = asyncio.create_task(check_server_health(server))
+    for server in ELECTRUM_SERVERS:
+        task = asyncio.create_task(check_server_health_simple(server))
         tasks.append((server, task))
     
+    new_healthy_servers = []
     for server, task in tasks:
         try:
-            is_healthy = await asyncio.wait_for(task, timeout=CONNECTION_TIMEOUT + 2)
+            is_healthy = await asyncio.wait_for(task, timeout=10)
             if is_healthy:
-                healthy_servers.append(server)
+                new_healthy_servers.append(server)
                 log_message(f"✅ Server {server['host']}:{server['port']} sehat", "INFO")
         except asyncio.TimeoutError:
             continue
     
-    # Jika sudah cukup server, langsung return
-    if len(healthy_servers) >= 3:
-        log_message(f"Ditemukan {len(healthy_servers)} server Electrum yang sehat", "INFO")
-        return healthy_servers
-    
-    # Cek server lainnya jika perlu
-    tasks = []
-    for server in other_servers:
-        task = asyncio.create_task(check_server_health(server))
-        tasks.append((server, task))
-    
-    for server, task in tasks:
-        try:
-            is_healthy = await asyncio.wait_for(task, timeout=CONNECTION_TIMEOUT + 2)
-            if is_healthy:
-                healthy_servers.append(server)
-                log_message(f"✅ Server {server['host']}:{server['port']} sehat", "INFO")
-        except asyncio.TimeoutError:
-            continue
+    with healthy_servers_lock:
+        healthy_servers = new_healthy_servers
+        last_health_check = time.time()
     
     if not healthy_servers:
-        raise Exception("Tidak ada server Electrum yang sehat!")
+        log_message("⚠️ Tidak ada server Electrum yang sehat!", "WARNING")
+    else:
+        log_message(f"✅ Health check selesai: {len(healthy_servers)} server sehat", "INFO")
     
-    log_message(f"Ditemukan {len(healthy_servers)} server Electrum yang sehat", "INFO")
-    return healthy_servers
+    return len(healthy_servers) > 0
 
-async def check_balance_electrum_single(address, server_info):
+def get_healthy_server():
+    """Dapatkan satu server sehat (round-robin)"""
+    global healthy_servers
+    
+    with healthy_servers_lock:
+        if not healthy_servers:
+            return None
+        
+        # Simple round-robin
+        server = random.choice(healthy_servers)  # Gunakan random untuk load balancing
+        return server
+
+def should_perform_health_check():
+    """Cek apakah perlu melakukan health check"""
+    global last_health_check
+    
+    current_time = time.time()
+    if current_time - last_health_check > HEALTH_CHECK_INTERVAL:
+        return True
+    
+    # Jika tidak ada server sehat, cek lebih sering
+    with healthy_servers_lock:
+        if not healthy_servers and current_time - last_health_check > 300:  # 5 menit
+            return True
+    
+    return False
+
+async def check_balance_electrum_simple(address, server_info):
     """Check balance untuk satu address dengan Electrum"""
+    if not server_info:
+        return 0
+    
     for attempt in range(MAX_RETRIES):
         try:
             ssl_context = create_ssl_context()
@@ -304,105 +302,37 @@ async def check_balance_electrum_single(address, server_info):
                 else:
                     return 0
                     
-        except (asyncio.TimeoutError, ConnectionError, socket.error, OSError) as e:
+        except (asyncio.TimeoutError, ConnectionError, socket.error, OSError):
             if attempt < MAX_RETRIES - 1:
-                await asyncio.sleep(0.5 * (attempt + 1))  # Exponential backoff
+                await asyncio.sleep(0.5 * (attempt + 1))
                 continue
             else:
                 return 0
-        except Exception as e:
+        except Exception:
             return 0
     
     return 0
 
-async def check_balance_electrum_batch(addresses, server_info):
-    """Check batch of addresses menggunakan Electrum"""
-    results = {}
+def check_balance_single(address):
+    """Cek balance untuk satu address (synchronous wrapper)"""
+    if not CHECK_BALANCE:
+        return 0
     
-    for address in addresses:
-        balance = await check_balance_electrum_single(address, server_info)
-        results[address] = balance
+    # Dapatkan server sehat
+    server = get_healthy_server()
+    if not server:
+        return 0
     
-    return results
-
-# ========== SIMPLE ELECTRUM BALANCE CHECKER ==========
-class SimpleElectrumChecker:
-    """Class sederhana untuk pengecekan balance menggunakan Electrum"""
-    
-    def __init__(self):
-        self.healthy_servers = []
-        self.current_server_index = 0
-        self._lock = threading.Lock()
-        self._last_health_check = 0
-        self._health_check_interval = 300  # 5 menit
+    try:
+        # Buat event loop untuk thread ini
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         
-    async def ensure_healthy_servers(self):
-        """Pastikan ada server yang sehat"""
-        current_time = time.time()
-        
-        # Cek ulang kesehatan server setiap interval
-        if not self.healthy_servers or (current_time - self._last_health_check) > self._health_check_interval:
-            try:
-                self.healthy_servers = await get_healthy_servers()
-                self._last_health_check = current_time
-                self.current_server_index = 0
-            except Exception as e:
-                log_message(f"Gagal mendapatkan server sehat: {e}", "ERROR")
-                if not self.healthy_servers:
-                    raise Exception("Tidak ada server Electrum yang tersedia")
-        
-        return self.healthy_servers
-    
-    def get_next_server(self):
-        """Dapatkan server berikutnya (round-robin)"""
-        with self._lock:
-            if not self.healthy_servers:
-                return None
-            
-            server = self.healthy_servers[self.current_server_index]
-            self.current_server_index = (self.current_server_index + 1) % len(self.healthy_servers)
-            return server
-    
-    def check_balance_sync(self, address):
-        """Cek balance secara synchronous"""
-        if not CHECK_BALANCE:
-            return 0
-        
-        try:
-            # Buat event loop baru untuk thread ini
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            async def check():
-                try:
-                    # Pastikan ada server sehat
-                    servers = await self.ensure_healthy_servers()
-                    if not servers:
-                        return 0
-                    
-                    # Coba beberapa server
-                    for _ in range(min(3, len(servers))):
-                        server = self.get_next_server()
-                        if not server:
-                            continue
-                        
-                        balance = await check_balance_electrum_single(address, server)
-                        if balance is not None:
-                            return balance
-                    
-                    return 0
-                except Exception as e:
-                    return 0
-            
-            balance = loop.run_until_complete(check())
-            loop.close()
-            return balance
-            
-        except Exception as e:
-            return 0
-
-# ========== GLOBAL ELECTRUM CHECKER ==========
-electrum_checker = SimpleElectrumChecker()
+        balance = loop.run_until_complete(check_balance_electrum_simple(address, server))
+        loop.close()
+        return balance
+    except:
+        return 0
 
 # ========== WALLET GENERATION ==========
 def generate_wallet(key_number):
@@ -431,7 +361,7 @@ def generate_wallet(key_number):
         # 4. Cek Balance jika diaktifkan (HANYA ELECTRUM)
         balance = 0
         if CHECK_BALANCE:
-            balance = electrum_checker.check_balance_sync(address)
+            balance = check_balance_single(address)
         
         result = {
             'number': key_number,
@@ -559,18 +489,18 @@ def print_banner():
 ║  ██   ██ ██   ██    ██    ██      ██   ██ ██ ██  ██ ██ ██   ██  ║
 ║  ██████  ██   ██    ██    ██      ██   ██ ██ ██   ████ ██████   ║
 ║                                                                  ║
-║               BITCOIN WALLET SCANNER v2.4                        ║
-║          Simplified Pure Electrum Balance Check                  ║
+║               BITCOIN WALLET SCANNER v2.5                        ║
+║           OPTIMIZED Electrum Balance Check                       ║
 ║               Author: MMDRZA.COM                                 ║
 ║                                                                  ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║                                                                  ║
 ║  [✓] Mode: Random Scanning                                       ║
 ║  [✓] Multithreading: {MAX_THREADS:<3} threads                                   ║
-║  [✓] Balance Checking: PURE ELECTRUM ONLY                        ║
-║  [✓] Electrum Servers: {len(ELECTRUM_SERVERS):<3} (priority based)              ║
+║  [✓] Balance Checking: OPTIMIZED ELECTRUM                        ║
+║  [✓] Electrum Servers: {len(ELECTRUM_SERVERS):<3} (single health check)         ║
 ║  [✓] Batch Size: {BATCH_SIZE:<6}                                              ║
-║  [✓] Max Retries: {MAX_RETRIES:<3}                                            ║
+║  [✓] Health Check Interval: 30 menit                             ║
 ║  [✓] Connection Timeout: {CONNECTION_TIMEOUT}s                                 ║
 ║                                                                  ║
 ║  Output Files:                                                   ║
@@ -584,37 +514,55 @@ def print_banner():
     
     print(banner)
     print("\n" + "=" * 70)
-    print("Starting random wallet generation with SIMPLIFIED Electrum balance checking...")
+    print("Starting random wallet generation with OPTIMIZED Electrum balance checking...")
     print("=" * 70)
 
-# ========== INITIALIZE ELECTRUM CHECKER ==========
-def initialize_electrum_checker():
-    """Initialize Electrum checker di awal"""
+# ========== INITIALIZE ELECTRUM ==========
+def initialize_electrum():
+    """Initialize Electrum sekali di awal"""
+    global CHECK_BALANCE
+    
+    if not CHECK_BALANCE:
+        return True
+    
     try:
-        log_message("Initializing Electrum checker...", "INFO")
-        
-        async def init():
-            try:
-                await electrum_checker.ensure_healthy_servers()
-                return True
-            except Exception as e:
-                log_message(f"Failed to initialize Electrum checker: {e}", "ERROR")
-                return False
+        log_message("Initializing Electrum servers...", "INFO")
         
         # Buat event loop untuk initialization
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        success = loop.run_until_complete(init())
+        success = loop.run_until_complete(perform_health_check())
         loop.close()
         
         if not success:
-            log_message("WARNING: Electrum checker initialization failed. Balance checking may not work.", "WARNING")
+            log_message("⚠️ Tidak ada server Electrum yang sehat. Menonaktifkan balance checking.", "WARNING")
+            CHECK_BALANCE = False
             return False
         
-        return success
+        return True
     except Exception as e:
-        log_message(f"Error initializing Electrum checker: {e}", "ERROR")
+        log_message(f"Error initializing Electrum: {e}", "ERROR")
+        log_message("⚠️ Menonaktifkan balance checking.", "WARNING")
+        CHECK_BALANCE = False
         return False
+
+# ========== PERIODIC HEALTH CHECK ==========
+def periodic_health_check():
+    """Thread untuk periodic health check"""
+    while True:
+        time.sleep(60)  # Cek setiap 1 menit apakah perlu health check
+        
+        if not CHECK_BALANCE:
+            continue
+        
+        if should_perform_health_check():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(perform_health_check())
+                loop.close()
+            except:
+                pass
 
 # ========== MAIN SCANNER ==========
 def main_scanner():
@@ -622,14 +570,8 @@ def main_scanner():
     # Tampilkan banner
     print_banner()
     
-    # Declare CHECK_BALANCE as global at the beginning of the function
-    global CHECK_BALANCE
-    
-    # Initialize Electrum checker
-    if CHECK_BALANCE:
-        if not initialize_electrum_checker():
-            log_message("Continuing without balance checking...", "WARNING")
-            CHECK_BALANCE = False
+    # Initialize Electrum sekali di awal
+    initialize_electrum()
     
     # Load progress jika ada
     wallets_generated = load_progress()
@@ -652,6 +594,10 @@ def main_scanner():
                 stats['rich_found'] = rich_count
         except:
             pass
+    
+    # Start periodic health check thread
+    health_check_thread = threading.Thread(target=periodic_health_check, daemon=True)
+    health_check_thread.start()
     
     try:
         batch_counter = 0
