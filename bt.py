@@ -26,8 +26,8 @@ SAVE_INTERVAL = 1000               # Simpan progress setiap 1000 wallet
 USE_ELECTRUM_API = True            # Gunakan Electrum API yang lebih cepat
 ELECTRUM_MAX_CONCURRENT = 8        # Koneksi concurrent ke Electrum
 USE_MULTIPROCESSING = True         # Gunakan multiprocessing untuk balance check
-MAX_RETRIES = 3                    # Maksimal retry untuk koneksi Electrum
-CONNECTION_TIMEOUT = 10            # Timeout koneksi Electrum (detik)
+MAX_RETRIES = 2                    # Maksimal retry untuk koneksi Electrum
+CONNECTION_TIMEOUT = 8             # Timeout koneksi Electrum (detik)
 
 # ========== INISIALISASI ==========
 PACKER = Struct(">QQQQ")            # Untuk konversi 256-bit integer
@@ -42,26 +42,18 @@ PROGRESS_FILE = "progress.txt"      # Progress checkpoint
 
 # ========== ELECTRUM SERVER LIST (DIPERBARUI) ==========
 ELECTRUM_SERVERS = [
-    {"host": "electrumx-core.1209k.com", "port": 50002, "protocol": "ssl"},
-    {"host": "bitcoin.aranguren.org", "port": 50002, "protocol": "ssl"},
-    {"host": "electrum.loyce.club", "port": 50002, "protocol": "ssl"},
-    {"host": "fulcrum.slicksparks.ky", "port": 50002, "protocol": "ssl"},
-    {"host": "electrum.kampfschnitzel.at", "port": 50002, "protocol": "ssl"},
-    {"host": "electrum.sare.red", "port": 50002, "protocol": "ssl"},
-    {"host": "blackie.c3-soft.com", "port": 57002, "protocol": "ssl"},
-    {"host": "fulcrum2.not.fyi", "port": 51002, "protocol": "ssl"},
-    {"host": "electrum.cakewallet.com", "port": 50002, "protocol": "ssl"},
-    {"host": "molten.tranquille.cc", "port": 50002, "protocol": "ssl"},
-    {"host": "clownshow.fiatfaucet.com", "port": 50002, "protocol": "ssl"},
-    {"host": "btc.electroncash.dk", "port": 60002, "protocol": "ssl"},
-    {"host": "tool.sh", "port": 50002, "protocol": "ssl"},
-    {"host": "fulcrum.bitcoinrocks.net", "port": 50002, "protocol": "ssl"},
-    {"host": "electrum.qtornado.com", "port": 50002, "protocol": "ssl"},
-    {"host": "electrum.blockstream.info", "port": 50002, "protocol": "ssl"},
-    {"host": "electrum.emzy.de", "port": 50002, "protocol": "ssl"},
-    {"host": "electrum.hodlister.co", "port": 50002, "protocol": "ssl"},
-    {"host": "electrum.villocq.com", "port": 50002, "protocol": "ssl"},
-    {"host": "electrumx.bot.nu", "port": 50002, "protocol": "ssl"},
+    {"host": "electrumx-core.1209k.com", "port": 50002, "protocol": "ssl", "priority": 1},
+    {"host": "bitcoin.aranguren.org", "port": 50002, "protocol": "ssl", "priority": 1},
+    {"host": "electrum.loyce.club", "port": 50002, "protocol": "ssl", "priority": 1},
+    {"host": "fulcrum.slicksparks.ky", "port": 50002, "protocol": "ssl", "priority": 1},
+    {"host": "electrum.kampfschnitzel.at", "port": 50002, "protocol": "ssl", "priority": 2},
+    {"host": "electrum.sare.red", "port": 50002, "protocol": "ssl", "priority": 2},
+    {"host": "blackie.c3-soft.com", "port": 57002, "protocol": "ssl", "priority": 2},
+    {"host": "fulcrum2.not.fyi", "port": 51002, "protocol": "ssl", "priority": 2},
+    {"host": "electrum.cakewallet.com", "port": 50002, "protocol": "ssl", "priority": 3},
+    {"host": "molten.tranquille.cc", "port": 50002, "protocol": "ssl", "priority": 3},
+    {"host": "clownshow.fiatfaucet.com", "port": 50002, "protocol": "ssl", "priority": 3},
+    {"host": "btc.electroncash.dk", "port": 60002, "protocol": "ssl", "priority": 3},
 ]
 
 # ========== FUNGSI UTILITAS ==========
@@ -211,36 +203,71 @@ async def check_server_health(server_info):
     """Cek kesehatan server Electrum"""
     try:
         ssl_context = create_ssl_context()
+        # Gunakan asyncio.wait_for untuk timeout, bukan parameter di connect_rs
         async with connect_rs(
             server_info["host"], 
             server_info["port"], 
-            ssl=ssl_context,
-            timeout=CONNECTION_TIMEOUT
+            ssl=ssl_context
         ) as session:
-            # Test connection dengan request sederhana
-            version = await session.send_request("server.version", ["electrum-client", "1.4"])
-            if version:
-                return True
-    except (asyncio.TimeoutError, ConnectionError, socket.error) as e:
-        log_message(f"Server {server_info['host']}:{server_info['port']} tidak sehat: {e}", "WARNING")
+            # Test connection dengan timeout
+            try:
+                version = await asyncio.wait_for(
+                    session.send_request("server.version", ["electrum-client", "1.4"]),
+                    timeout=CONNECTION_TIMEOUT
+                )
+                if version:
+                    return True
+            except asyncio.TimeoutError:
+                return False
+    except (ConnectionError, socket.error, OSError) as e:
+        # Jangan log error untuk setiap server yang gagal, terlalu banyak spam
+        return False
     except Exception as e:
-        log_message(f"Error checking server {server_info['host']}:{server_info['port']}: {e}", "WARNING")
+        return False
     return False
 
 async def get_healthy_servers():
     """Dapatkan server yang sehat"""
     healthy_servers = []
-    tasks = []
     
-    for server in ELECTRUM_SERVERS:
+    log_message("Memeriksa kesehatan server Electrum...", "INFO")
+    
+    # Coba server dengan priority tinggi dulu
+    priority_servers = [s for s in ELECTRUM_SERVERS if s.get("priority", 3) <= 2]
+    other_servers = [s for s in ELECTRUM_SERVERS if s.get("priority", 3) > 2]
+    
+    # Cek server priority tinggi
+    tasks = []
+    for server in priority_servers:
         task = asyncio.create_task(check_server_health(server))
         tasks.append((server, task))
     
     for server, task in tasks:
         try:
-            is_healthy = await asyncio.wait_for(task, timeout=CONNECTION_TIMEOUT)
+            is_healthy = await asyncio.wait_for(task, timeout=CONNECTION_TIMEOUT + 2)
             if is_healthy:
                 healthy_servers.append(server)
+                log_message(f"✅ Server {server['host']}:{server['port']} sehat", "INFO")
+        except asyncio.TimeoutError:
+            continue
+    
+    # Jika sudah cukup server, langsung return
+    if len(healthy_servers) >= 3:
+        log_message(f"Ditemukan {len(healthy_servers)} server Electrum yang sehat", "INFO")
+        return healthy_servers
+    
+    # Cek server lainnya jika perlu
+    tasks = []
+    for server in other_servers:
+        task = asyncio.create_task(check_server_health(server))
+        tasks.append((server, task))
+    
+    for server, task in tasks:
+        try:
+            is_healthy = await asyncio.wait_for(task, timeout=CONNECTION_TIMEOUT + 2)
+            if is_healthy:
+                healthy_servers.append(server)
+                log_message(f"✅ Server {server['host']}:{server['port']} sehat", "INFO")
         except asyncio.TimeoutError:
             continue
     
@@ -250,21 +277,20 @@ async def get_healthy_servers():
     log_message(f"Ditemukan {len(healthy_servers)} server Electrum yang sehat", "INFO")
     return healthy_servers
 
-async def check_balance_electrum_with_retry(address, server_info, retries=MAX_RETRIES):
-    """Check balance menggunakan Electrum protocol dengan retry mechanism"""
-    for attempt in range(retries):
+async def check_balance_electrum_single(address, server_info):
+    """Check balance untuk satu address dengan Electrum"""
+    for attempt in range(MAX_RETRIES):
         try:
             ssl_context = create_ssl_context()
             async with connect_rs(
                 server_info["host"], 
                 server_info["port"], 
-                ssl=ssl_context,
-                timeout=CONNECTION_TIMEOUT
+                ssl=ssl_context
             ) as session:
                 # Get script hash
                 scripthash = address_to_scripthash(address)
                 
-                # Request balance
+                # Request balance dengan timeout
                 result = await asyncio.wait_for(
                     session.send_request("blockchain.scripthash.get_balance", [scripthash]),
                     timeout=CONNECTION_TIMEOUT
@@ -278,86 +304,105 @@ async def check_balance_electrum_with_retry(address, server_info, retries=MAX_RE
                 else:
                     return 0
                     
-        except (asyncio.TimeoutError, ConnectionError, socket.error) as e:
-            if attempt < retries - 1:
-                await asyncio.sleep(1 * (attempt + 1))  # Exponential backoff
+        except (asyncio.TimeoutError, ConnectionError, socket.error, OSError) as e:
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(0.5 * (attempt + 1))  # Exponential backoff
                 continue
             else:
-                log_message(f"Gagal koneksi ke {server_info['host']}:{server_info['port']} setelah {retries} percobaan: {e}", "WARNING")
                 return 0
         except Exception as e:
-            log_message(f"Error checking balance untuk {address}: {e}", "WARNING")
             return 0
     
     return 0
 
-async def check_balances_batch_electrum(addresses, server_info):
+async def check_balance_electrum_batch(addresses, server_info):
     """Check batch of addresses menggunakan Electrum"""
     results = {}
     
     for address in addresses:
-        balance = await check_balance_electrum_with_retry(address, server_info)
+        balance = await check_balance_electrum_single(address, server_info)
         results[address] = balance
     
     return results
 
-def check_balances_multiprocess(address_batch):
-    """Check balances menggunakan multiprocessing"""
-    if not CHECK_BALANCE or not USE_ELECTRUM_API or not address_batch:
-        return {addr: 0 for addr in address_batch}
+# ========== SIMPLE ELECTRUM BALANCE CHECKER ==========
+class SimpleElectrumChecker:
+    """Class sederhana untuk pengecekan balance menggunakan Electrum"""
     
-    try:
-        # Inisialisasi server manager di process ini
-        async def init_server_manager():
-            healthy_servers = await get_healthy_servers()
-            if not healthy_servers:
-                raise Exception("No healthy servers available")
-            return random.choice(healthy_servers)
+    def __init__(self):
+        self.healthy_servers = []
+        self.current_server_index = 0
+        self._lock = threading.Lock()
+        self._last_health_check = 0
+        self._health_check_interval = 300  # 5 menit
         
-        # Dapatkan server yang sehat
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        server = loop.run_until_complete(init_server_manager())
-        loop.close()
+    async def ensure_healthy_servers(self):
+        """Pastikan ada server yang sehat"""
+        current_time = time.time()
         
-        # Check balances dengan server yang sehat
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        results = loop.run_until_complete(check_balances_batch_electrum(address_batch, server))
-        loop.close()
+        # Cek ulang kesehatan server setiap interval
+        if not self.healthy_servers or (current_time - self._last_health_check) > self._health_check_interval:
+            try:
+                self.healthy_servers = await get_healthy_servers()
+                self._last_health_check = current_time
+                self.current_server_index = 0
+            except Exception as e:
+                log_message(f"Gagal mendapatkan server sehat: {e}", "ERROR")
+                if not self.healthy_servers:
+                    raise Exception("Tidak ada server Electrum yang tersedia")
         
-        return results
-    except Exception as e:
-        log_message(f"Multiprocess balance check error: {e}", "ERROR")
-        return {addr: 0 for addr in address_batch}
-
-# ========== BALANCE CHECKING (ELECTRUM ONLY) ==========
-def check_balance_electrum_only(address):
-    """Cek balance Bitcoin address HANYA dengan Electrum"""
-    if not CHECK_BALANCE or not USE_ELECTRUM_API:
-        return 0
+        return self.healthy_servers
     
-    try:
-        # Dapatkan server yang sehat terlebih dahulu
-        async def get_server_and_check():
-            healthy_servers = await get_healthy_servers()
-            if not healthy_servers:
-                return 0
+    def get_next_server(self):
+        """Dapatkan server berikutnya (round-robin)"""
+        with self._lock:
+            if not self.healthy_servers:
+                return None
             
-            server = random.choice(healthy_servers)
-            return await check_balance_electrum_with_retry(address, server)
+            server = self.healthy_servers[self.current_server_index]
+            self.current_server_index = (self.current_server_index + 1) % len(self.healthy_servers)
+            return server
+    
+    def check_balance_sync(self, address):
+        """Cek balance secara synchronous"""
+        if not CHECK_BALANCE:
+            return 0
         
-        # Buat event loop baru untuk thread ini
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        balance = loop.run_until_complete(get_server_and_check())
-        loop.close()
-        
-        return balance
-        
-    except Exception as e:
-        log_message(f"Electrum balance check failed for {address}: {e}", "WARNING")
-        return 0
+        try:
+            # Buat event loop baru untuk thread ini
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            async def check():
+                try:
+                    # Pastikan ada server sehat
+                    servers = await self.ensure_healthy_servers()
+                    if not servers:
+                        return 0
+                    
+                    # Coba beberapa server
+                    for _ in range(min(3, len(servers))):
+                        server = self.get_next_server()
+                        if not server:
+                            continue
+                        
+                        balance = await check_balance_electrum_single(address, server)
+                        if balance is not None:
+                            return balance
+                    
+                    return 0
+                except Exception as e:
+                    return 0
+            
+            balance = loop.run_until_complete(check())
+            loop.close()
+            return balance
+            
+        except Exception as e:
+            return 0
+
+# ========== GLOBAL ELECTRUM CHECKER ==========
+electrum_checker = SimpleElectrumChecker()
 
 # ========== WALLET GENERATION ==========
 def generate_wallet(key_number):
@@ -386,7 +431,7 @@ def generate_wallet(key_number):
         # 4. Cek Balance jika diaktifkan (HANYA ELECTRUM)
         balance = 0
         if CHECK_BALANCE:
-            balance = check_balance_electrum_only(address)
+            balance = electrum_checker.check_balance_sync(address)
         
         result = {
             'number': key_number,
@@ -407,73 +452,18 @@ def process_batch(batch_numbers):
     """Process batch of numbers dengan multithreading"""
     results = []
     
-    # Jika balance checking diaktifkan dan menggunakan Electrum dengan multiprocessing
-    if CHECK_BALANCE and USE_ELECTRUM_API and USE_MULTIPROCESSING and len(batch_numbers) > 1:
-        try:
-            # Generate semua wallet terlebih dahulu
-            wallets = []
-            for num in batch_numbers:
-                wallet = generate_wallet(num)
-                if wallet:
-                    wallets.append(wallet)
-            
-            # Check balances dalam batch menggunakan Electrum dengan multiprocessing
-            if wallets:
-                addresses = [w['address'] for w in wallets]
-                
-                # Gunakan multiprocessing untuk balance check
-                with ProcessPoolExecutor(max_workers=min(4, multiprocessing.cpu_count())) as executor:
-                    # Split addresses into chunks
-                    chunk_size = max(10, len(addresses) // 4)
-                    chunks = [addresses[i:i + chunk_size] for i in range(0, len(addresses), chunk_size)]
-                    
-                    # Submit chunks for processing
-                    future_to_chunk = {
-                        executor.submit(check_balances_multiprocess, chunk): chunk 
-                        for chunk in chunks
-                    }
-                    
-                    # Collect results
-                    balance_results = {}
-                    for future in as_completed(future_to_chunk):
-                        chunk_results = future.result()
-                        balance_results.update(chunk_results)
-                
-                # Update wallet balances
-                for wallet in wallets:
-                    wallet['balance'] = balance_results.get(wallet['address'], 0)
-                
-                results.extend(wallets)
-            else:
-                results = []
+    # Proses normal dengan threading
+    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+        futures = {executor.submit(generate_wallet, num): num for num in batch_numbers}
         
-        except Exception as e:
-            log_message(f"Batch processing error: {e}, falling back to single mode...", "ERROR")
-            # Fallback ke threading biasa
-            with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-                futures = {executor.submit(generate_wallet, num): num for num in batch_numbers}
-                
-                for future in as_completed(futures):
-                    try:
-                        result = future.result(timeout=10)
-                        if result:
-                            results.append(result)
-                    except Exception as e:
-                        num = futures[future]
-                        log_message(f"Timeout/Error for {num}: {e}", "WARNING")
-    else:
-        # Proses normal tanpa optimisasi batch
-        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-            futures = {executor.submit(generate_wallet, num): num for num in batch_numbers}
-            
-            for future in as_completed(futures):
-                try:
-                    result = future.result(timeout=10)
-                    if result:
-                        results.append(result)
-                except Exception as e:
-                    num = futures[future]
-                    log_message(f"Timeout/Error for {num}: {e}", "WARNING")
+        for future in as_completed(futures):
+            try:
+                result = future.result(timeout=15)  # Timeout lebih lama untuk Electrum
+                if result:
+                    results.append(result)
+            except Exception as e:
+                num = futures[future]
+                log_message(f"Timeout/Error for {num}: {e}", "WARNING")
     
     return results
 
@@ -569,8 +559,8 @@ def print_banner():
 ║  ██   ██ ██   ██    ██    ██      ██   ██ ██ ██  ██ ██ ██   ██  ║
 ║  ██████  ██   ██    ██    ██      ██   ██ ██ ██   ████ ██████   ║
 ║                                                                  ║
-║               BITCOIN WALLET SCANNER v2.3                        ║
-║           Pure Electrum Balance Check (No Fallback)              ║
+║               BITCOIN WALLET SCANNER v2.4                        ║
+║          Simplified Pure Electrum Balance Check                  ║
 ║               Author: MMDRZA.COM                                 ║
 ║                                                                  ║
 ╠══════════════════════════════════════════════════════════════════╣
@@ -578,9 +568,8 @@ def print_banner():
 ║  [✓] Mode: Random Scanning                                       ║
 ║  [✓] Multithreading: {MAX_THREADS:<3} threads                                   ║
 ║  [✓] Balance Checking: PURE ELECTRUM ONLY                        ║
-║  [✓] Electrum Servers: {len(ELECTRUM_SERVERS):<3} (health checked)               ║
+║  [✓] Electrum Servers: {len(ELECTRUM_SERVERS):<3} (priority based)              ║
 ║  [✓] Batch Size: {BATCH_SIZE:<6}                                              ║
-║  [✓] Multiprocessing: {("ENABLED" if USE_MULTIPROCESSING else "DISABLED"):<10}                ║
 ║  [✓] Max Retries: {MAX_RETRIES:<3}                                            ║
 ║  [✓] Connection Timeout: {CONNECTION_TIMEOUT}s                                 ║
 ║                                                                  ║
@@ -595,14 +584,49 @@ def print_banner():
     
     print(banner)
     print("\n" + "=" * 70)
-    print("Starting random wallet generation with PURE Electrum balance checking...")
+    print("Starting random wallet generation with SIMPLIFIED Electrum balance checking...")
     print("=" * 70)
+
+# ========== INITIALIZE ELECTRUM CHECKER ==========
+def initialize_electrum_checker():
+    """Initialize Electrum checker di awal"""
+    try:
+        log_message("Initializing Electrum checker...", "INFO")
+        
+        async def init():
+            try:
+                await electrum_checker.ensure_healthy_servers()
+                return True
+            except Exception as e:
+                log_message(f"Failed to initialize Electrum checker: {e}", "ERROR")
+                return False
+        
+        # Buat event loop untuk initialization
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        success = loop.run_until_complete(init())
+        loop.close()
+        
+        if not success:
+            log_message("WARNING: Electrum checker initialization failed. Balance checking may not work.", "WARNING")
+        
+        return success
+    except Exception as e:
+        log_message(f"Error initializing Electrum checker: {e}", "ERROR")
+        return False
 
 # ========== MAIN SCANNER ==========
 def main_scanner():
     """Main scanner function dengan multithreading"""
     # Tampilkan banner
     print_banner()
+    
+    # Initialize Electrum checker
+    if CHECK_BALANCE:
+        if not initialize_electrum_checker():
+            log_message("Continuing without balance checking...", "WARNING")
+            global CHECK_BALANCE
+            CHECK_BALANCE = False
     
     # Load progress jika ada
     wallets_generated = load_progress()
