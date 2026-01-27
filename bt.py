@@ -14,18 +14,19 @@ import bech32
 import ssl
 from aiorpcx import connect_rs
 import socket
-import concurrent.futures
 
 from utils import g, b58encode
 
 # ========== KONFIGURASI ==========
 MAX_THREADS = 8                     # Thread untuk wallet generation
-BATCH_SIZE = 1000                   # Ukuran batch
+BATCH_SIZE = 500                    # Batch lebih kecil untuk feedback lebih cepat
 CHECK_BALANCE = True               # Aktifkan pengecekan balance
-SAVE_INTERVAL = 1000               # Simpan progress setiap 1000 wallet
+SAVE_INTERVAL = 500                # Simpan progress lebih sering
 MAX_RETRIES = 1                    # Retry untuk koneksi
-CONNECTION_TIMEOUT = 5             # Timeout koneksi
-USE_SIMPLE_BALANCE = True          # Gunakan metode simple untuk balance check
+CONNECTION_TIMEOUT = 3             # Timeout lebih pendek
+BALANCE_TIMEOUT = 4                # Timeout untuk balance check
+USE_BALANCE_POOL = True            # Gunakan pool untuk balance checking
+BALANCE_POOL_SIZE = 4              # Thread khusus untuk balance check
 
 # ========== INISIALISASI ==========
 PACKER = Struct(">QQQQ")
@@ -38,21 +39,22 @@ RICH_WALLETS_FILE = "rich_wallets.txt"
 LOG_FILE = "scan.log"
 PROGRESS_FILE = "progress.txt"
 
-# ========== ELECTRUM SERVER LIST ==========
+# ========== ELECTRUM SERVER LIST (WORKING SERVERS) ==========
 ELECTRUM_SERVERS = [
-    {"host": "bitcoin.aranguren.org", "port": 50002},
-    {"host": "electrum.loyce.club", "port": 50002},
-    {"host": "electrum.emzy.de", "port": 50002},
+    {"host": "electrum.emzy.de", "port": 50002},  # Server yang lebih reliable
     {"host": "electrum.blockstream.info", "port": 50002},
+    {"host": "electrum.loyce.club", "port": 50002},
+    {"host": "bitcoin.aranguren.org", "port": 50002},
 ]
 
-# ========== GLOBAL EVENT LOOP ==========
-# Buat event loop di main thread
+# ========== GLOBAL STATE ==========
+healthy_servers = []
+server_cache_lock = threading.Lock()
+last_health_check = 0
+HEALTH_CHECK_INTERVAL = 600  # 10 menit
+balance_pool = None
 main_event_loop = None
-server_cache = []
-cache_lock = threading.Lock()
-cache_expiry = 0
-CACHE_DURATION = 300  # 5 menit
+event_loop_thread = None
 
 # ========== FUNGSI UTILITAS ==========
 def log_message(message, level="INFO"):
@@ -116,7 +118,6 @@ def base58_check_encode(prefix, payload, compressed=False):
 def pub_key_to_addr(pubkey_hex):
     """Generate Bitcoin address dari public key hex"""
     try:
-        # Method 1: Coba hashlib dengan RIPEMD-160
         ripemd160 = hashlib.new("ripemd160")
         hash_sha256 = hashlib.new("SHA256")
         hash_sha256.update(bytes.fromhex(pubkey_hex))
@@ -124,45 +125,14 @@ def pub_key_to_addr(pubkey_hex):
         return base58_check_encode(b"\0", ripemd160.digest())
     except:
         try:
-            # Method 2: Fallback
             sha256_hash = hashlib.sha256(bytes.fromhex(pubkey_hex)).digest()
             double_hash = hashlib.sha256(hashlib.sha256(sha256_hash).digest()).digest()
             pseudo_ripemd = double_hash[:20]
             return base58_check_encode(b"\0", pseudo_ripemd)
-        except Exception as e:
+        except:
             return "1ErrorAddress"
 
-# ========== ELECTRUM UTILITIES (FIXED) ==========
-def address_to_scripthash_simple(address: str) -> str:
-    """Convert Bitcoin address to script hash (simplified)"""
-    try:
-        if address.startswith("1"):  # P2PKH
-            decoded = base58.b58decode_check(address)
-            payload = decoded[1:]
-            script = b"\x76\xa9\x14" + payload + b"\x88\xac"
-        elif address.startswith("3"):  # P2SH
-            decoded = base58.b58decode_check(address)
-            payload = decoded[1:]
-            script = b"\xa9\x14" + payload + b"\x87"
-        elif address.startswith("bc1"):  # Bech32
-            # Simple fallback untuk bech32
-            hrp = "bc"
-            witver, witprog = bech32.decode(hrp, address)
-            if witver == 0:
-                if len(witprog) == 20:
-                    script = bytes([0x00, 0x14]) + bytes(witprog)
-                else:
-                    script = bytes([0x00, 0x20]) + bytes(witprog)
-            else:
-                script = bytes([0x51, 0x20]) + bytes(witprog)
-        else:
-            return "00" * 32
-        
-        scripthash = hashlib.sha256(script).digest()[::-1].hex()
-        return scripthash
-    except Exception as e:
-        return "00" * 32
-
+# ========== SIMPLE ELECTRUM UTILITIES ==========
 def create_ssl_context():
     """Create SSL context"""
     ssl_context = ssl.create_default_context()
@@ -170,122 +140,113 @@ def create_ssl_context():
     ssl_context.verify_mode = ssl.CERT_NONE
     return ssl_context
 
-async def check_server_health_async(server_info):
-    """Check server health asynchronously"""
-    try:
-        ssl_context = create_ssl_context()
-        async with connect_rs(
-            server_info["host"], 
-            server_info["port"], 
-            ssl=ssl_context
-        ) as session:
-            result = await asyncio.wait_for(
-                session.send_request("server.ping", []),
-                timeout=3
-            )
-            return True
-    except:
-        return False
+def get_server():
+    """Dapatkan satu server dari cache"""
+    with server_cache_lock:
+        if not healthy_servers:
+            return None
+        return random.choice(healthy_servers)
 
-async def get_healthy_servers_async():
-    """Get healthy servers asynchronously"""
-    tasks = []
-    for server in ELECTRUM_SERVERS:
-        tasks.append(check_server_health_async(server))
-    
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    healthy = []
-    for i, result in enumerate(results):
-        if result is True:
-            healthy.append(ELECTRUM_SERVERS[i])
-    
-    return healthy
-
-def get_healthy_servers_sync():
-    """Get healthy servers synchronously (run in main event loop)"""
-    global main_event_loop, server_cache, cache_expiry
-    
-    current_time = time.time()
-    
-    # Cek cache
-    with cache_lock:
-        if server_cache and current_time < cache_expiry:
-            return server_cache.copy()
-    
-    # Jika cache expired atau kosong, fetch baru
-    if main_event_loop is None:
-        return []  # Event loop belum diinisialisasi
-    
-    try:
-        # Jalankan di main event loop
-        healthy_servers = asyncio.run_coroutine_threadsafe(
-            get_healthy_servers_async(),
-            main_event_loop
-        ).result(timeout=10)
-        
-        with cache_lock:
-            server_cache = healthy_servers.copy()
-            cache_expiry = current_time + CACHE_DURATION
-        
-        log_message(f"Found {len(healthy_servers)} healthy servers", "INFO")
-        return healthy_servers
-    except Exception as e:
-        log_message(f"Error getting healthy servers: {e}", "ERROR")
-        return []
-
-async def check_balance_single_async(address, server_info):
-    """Check balance for single address asynchronously"""
-    try:
-        ssl_context = create_ssl_context()
-        async with connect_rs(
-            server_info["host"], 
-            server_info["port"], 
-            ssl=ssl_context
-        ) as session:
-            scripthash = address_to_scripthash_simple(address)
-            result = await asyncio.wait_for(
-                session.send_request("blockchain.scripthash.get_balance", [scripthash]),
-                timeout=CONNECTION_TIMEOUT
-            )
-            
-            if isinstance(result, dict):
-                return result.get("confirmed", 0) + result.get("unconfirmed", 0)
-            return 0
-    except:
-        return 0
-
-def check_balance_single_sync(address):
-    """Check balance synchronously using thread pool"""
+def check_balance_simple(address):
+    """Check balance dengan cara sederhana dan cepat"""
     if not CHECK_BALANCE:
         return 0
     
-    healthy_servers = get_healthy_servers_sync()
-    if not healthy_servers:
+    server = get_server()
+    if not server:
         return 0
     
-    # Pilih server random
-    server = random.choice(healthy_servers)
-    
-    # Jalankan async function di thread pool
     try:
-        if main_event_loop is None:
-            return 0
+        # Gunakan requests sebagai fallback yang lebih sederhana
+        # Electrum API via HTTP (banyak server support ini)
+        url = f"http://{server['host']}:{server.get('http_port', 8080) if 'http_port' in server else 8080}/api/address/{address}"
+        try:
+            import requests
+            response = requests.get(url, timeout=2)
+            if response.status_code == 200:
+                data = response.json()
+                return data.get('balance', 0)
+        except:
+            pass
         
-        # Submit task ke event loop
-        future = asyncio.run_coroutine_threadsafe(
-            check_balance_single_async(address, server),
-            main_event_loop
-        )
+        # Fallback ke blockchain.info
+        url = f"https://blockchain.info/balance?active={address}"
+        response = requests.get(url, timeout=3)
+        if response.status_code == 200:
+            data = response.json()
+            return data.get(address, {}).get('final_balance', 0)
         
-        # Tunggu hasil dengan timeout
-        balance = future.result(timeout=CONNECTION_TIMEOUT + 2)
-        return balance
+        return 0
     except:
         return 0
 
+# ========== BALANCE CHECKER POOL ==========
+class BalanceCheckerPool:
+    """Pool untuk mengecek balance secara paralel"""
+    
+    def __init__(self, size=4):
+        self.size = size
+        self.executor = ThreadPoolExecutor(max_workers=size)
+        self.address_queue = []
+        self.result_cache = {}
+        self.cache_lock = threading.Lock()
+        self.cache_expiry = {}
+        self.max_cache_age = 300  # 5 menit
+        
+    def check_balance_batch(self, addresses):
+        """Check balance untuk batch addresses"""
+        if not addresses:
+            return {}
+        
+        # Filter addresses yang sudah di cache
+        current_time = time.time()
+        results = {}
+        addresses_to_check = []
+        
+        with self.cache_lock:
+            for address in addresses:
+                if address in self.result_cache and current_time < self.cache_expiry.get(address, 0):
+                    results[address] = self.result_cache[address]
+                else:
+                    addresses_to_check.append(address)
+        
+        # Jika semua sudah di cache, return
+        if not addresses_to_check:
+            return results
+        
+        # Check balance untuk addresses yang belum di cache
+        batch_results = {}
+        
+        # Submit tasks
+        futures = {}
+        for address in addresses_to_check:
+            future = self.executor.submit(check_balance_simple, address)
+            futures[future] = address
+        
+        # Collect results
+        for future in as_completed(futures):
+            address = futures[future]
+            try:
+                balance = future.result(timeout=BALANCE_TIMEOUT)
+                batch_results[address] = balance
+                
+                # Update cache
+                with self.cache_lock:
+                    self.result_cache[address] = balance
+                    self.cache_expiry[address] = current_time + self.max_cache_age
+            except:
+                batch_results[address] = 0
+        
+        # Merge results
+        results.update(batch_results)
+        return results
+    
+    def shutdown(self):
+        """Shutdown pool"""
+        self.executor.shutdown(wait=False)
+
 # ========== WALLET GENERATION ==========
-def generate_wallet(key_number):
+def generate_wallet(key_number, balance_checker=None):
     """Generate Bitcoin wallet dari number"""
     try:
         # Convert number to hex key
@@ -310,10 +271,12 @@ def generate_wallet(key_number):
         
         # 4. Cek Balance jika diaktifkan
         balance = 0
-        if CHECK_BALANCE and USE_SIMPLE_BALANCE:
-            balance = check_balance_single_sync(address)
+        if CHECK_BALANCE and balance_checker:
+            # Gunakan balance checker pool
+            results = balance_checker.check_balance_batch([address])
+            balance = results.get(address, 0)
         
-        result = {
+        return {
             'number': key_number,
             'private_key': private_key_wif,
             'public_key': public_key_compressed,
@@ -322,25 +285,30 @@ def generate_wallet(key_number):
             'timestamp': datetime.now().isoformat()
         }
         
-        return result
-        
     except Exception as e:
         return None
 
-def process_batch(batch_numbers):
+def process_batch(batch_numbers, balance_checker=None):
     """Process batch of numbers dengan multithreading"""
     results = []
     
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        futures = {executor.submit(generate_wallet, num): num for num in batch_numbers}
+        # Submit semua tasks
+        futures = {}
+        for num in batch_numbers:
+            future = executor.submit(generate_wallet, num, balance_checker)
+            futures[future] = num
         
+        # Collect results
+        completed = 0
         for future in as_completed(futures):
+            completed += 1
             try:
                 result = future.result(timeout=10)
                 if result:
                     results.append(result)
-            except Exception as e:
-                continue  # Skip error, continue
+            except:
+                continue
     
     return results
 
@@ -385,20 +353,23 @@ def save_wallet_result(result):
         return False
 
 # ========== DISPLAY PROGRESS ==========
-def display_progress(stats, start_time, batch_num):
+def display_progress(stats, start_time, batch_num, last_update):
     """Display progress bar dan statistik"""
-    elapsed = time.time() - start_time
+    current_time = time.time()
+    elapsed = current_time - start_time
     processed = stats.get('processed', 0)
     rich_found = stats.get('rich_found', 0)
     
     if processed > 0 and elapsed > 0:
         keys_per_sec = processed / elapsed
+        time_per_wallet = elapsed / processed * 1000  # ms per wallet
     else:
         keys_per_sec = 0
+        time_per_wallet = 0
     
     # Progress bar
     bar_length = 40
-    progress_percent = min(100, (processed % 1000) * 100 / 1000)
+    progress_percent = min(100, (processed % 500) * 100 / 500)
     
     filled = int(bar_length * progress_percent / 100)
     bar = '█' * filled + '░' * (bar_length - filled)
@@ -409,19 +380,26 @@ def display_progress(stats, start_time, batch_num):
     seconds = int(elapsed % 60)
     time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
     
+    # Status servers
+    with server_cache_lock:
+        server_status = f"{len(healthy_servers)}/{len(ELECTRUM_SERVERS)}"
+    
     # Tampilkan
     progress_line = (
         f"\r[{bar}] {progress_percent:5.1f}% | "
         f"Batch: {batch_num:3d} | "
-        f"Wallets: {processed:9,} | "
-        f"Rich: {rich_found:3,} | "
-        f"Speed: {keys_per_sec:6.1f}/s | "
+        f"Wallets: {processed:6,} | "
+        f"Rich: {rich_found:3d} | "
+        f"Speed: {keys_per_sec:5.1f}/s | "
+        f"Servers: {server_status} | "
         f"Time: {time_str}"
     )
     
     with print_lock:
         sys.stdout.write(progress_line)
         sys.stdout.flush()
+    
+    return current_time
 
 def print_banner():
     """Tampilkan banner program"""
@@ -436,18 +414,18 @@ def print_banner():
 ║  ██   ██ ██   ██    ██    ██      ██   ██ ██ ██  ██ ██ ██   ██  ║
 ║  ██████  ██   ██    ██    ██      ██   ██ ██ ██   ████ ██████   ║
 ║                                                                  ║
-║               BITCOIN WALLET SCANNER v3.1                        ║
-║           FIXED Event Loop Management                            ║
+║               BITCOIN WALLET SCANNER v3.2                        ║
+║           OPTIMIZED Balance Checker Pool                         ║
 ║               Author: MMDRZA.COM                                 ║
 ║                                                                  ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║                                                                  ║
-║  [✓] Mode: Random Scanning                                       ║
-║  [✓] Threads: {MAX_THREADS:<3}                                     ║
-║  [✓] Balance Checking: {("ENABLED" if CHECK_BALANCE else "DISABLED"):<10}         ║
-║  [✓] Electrum Servers: {len(ELECTRUM_SERVERS):<3}                               ║
-║  [✓] Batch Size: {BATCH_SIZE:<6}                                  ║
-║  [✓] Timeout: {CONNECTION_TIMEOUT}s                               ║
+║  [✓] Mode: Random Scanning (Optimized)                           ║
+║  [✓] Generation Threads: {MAX_THREADS:<2}                          ║
+║  [✓] Balance Checker Pool: {BALANCE_POOL_SIZE:<2} threads          ║
+║  [✓] Balance Checking: {("ENABLED" if CHECK_BALANCE else "DISABLED"):<8} ║
+║  [✓] Batch Size: {BATCH_SIZE:<4}                                ║
+║  [✓] Timeout: {BALANCE_TIMEOUT}s per balance check              ║
 ║                                                                  ║
 ║  Press Ctrl+C to stop                                           ║
 ║                                                                  ║
@@ -456,45 +434,78 @@ def print_banner():
     
     print(banner)
     print("\n" + "=" * 70)
-    print("Starting random wallet generation with FIXED event loop...")
+    print("Starting optimized wallet generation with balance checker pool...")
     print("=" * 70)
+
+# ========== HEALTH CHECK ==========
+def simple_health_check():
+    """Health check sederhana menggunakan requests"""
+    global healthy_servers, last_health_check
+    
+    current_time = time.time()
+    if current_time - last_health_check < HEALTH_CHECK_INTERVAL:
+        return
+    
+    log_message("Performing health check...", "INFO")
+    
+    new_healthy_servers = []
+    
+    for server in ELECTRUM_SERVERS:
+        try:
+            # Coba koneksi sederhana
+            import requests
+            # Coba port 80/443 untuk HTTP API
+            test_urls = [
+                f"http://{server['host']}:80/",
+                f"http://{server['host']}:8080/",
+                f"https://{server['host']}:443/"
+            ]
+            
+            success = False
+            for url in test_urls:
+                try:
+                    response = requests.get(url, timeout=2)
+                    if response.status_code < 500:  # Tidak error server
+                        success = True
+                        break
+                except:
+                    continue
+            
+            if success:
+                new_healthy_servers.append(server)
+                log_message(f"✅ Server {server['host']} is reachable", "INFO")
+            else:
+                log_message(f"❌ Server {server['host']} not reachable", "WARNING")
+                
+        except Exception as e:
+            continue
+    
+    with server_cache_lock:
+        healthy_servers = new_healthy_servers
+        last_health_check = current_time
+    
+    if not healthy_servers:
+        log_message("⚠️ No servers available, using fallback method", "WARNING")
+    else:
+        log_message(f"✅ Health check complete: {len(healthy_servers)} servers available", "INFO")
 
 # ========== INITIALIZE ==========
 def initialize():
     """Initialize program"""
-    global main_event_loop
+    global balance_pool
     
     log_message("Initializing...", "INFO")
     
-    # Setup event loop dengan cara yang benar
-    try:
-        # Coba dapatkan running loop
-        main_event_loop = asyncio.get_running_loop()
-    except RuntimeError:
-        # Jika tidak ada, buat baru
-        main_event_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(main_event_loop)
+    # Simple health check
+    simple_health_check()
     
-    # Start event loop thread
-    def run_event_loop():
-        asyncio.set_event_loop(main_event_loop)
-        main_event_loop.run_forever()
-    
-    event_loop_thread = threading.Thread(target=run_event_loop, daemon=True)
-    event_loop_thread.start()
-    
-    # Tunggu event loop ready
-    time.sleep(1)
-    
-    # Health check servers
-    if CHECK_BALANCE:
-        healthy_servers = get_healthy_servers_sync()
-        if not healthy_servers:
-            log_message("WARNING: No healthy Electrum servers found", "WARNING")
-        else:
-            log_message(f"✅ {len(healthy_servers)} Electrum servers ready", "INFO")
+    # Setup balance checker pool
+    if CHECK_BALANCE and USE_BALANCE_POOL:
+        balance_pool = BalanceCheckerPool(size=BALANCE_POOL_SIZE)
+        log_message(f"Balance checker pool initialized with {BALANCE_POOL_SIZE} threads", "INFO")
     
     log_message("Initialization complete", "INFO")
+    return balance_pool
 
 # ========== MAIN SCANNER ==========
 def main_scanner():
@@ -503,7 +514,7 @@ def main_scanner():
     print_banner()
     
     # Initialize
-    initialize()
+    balance_checker = initialize()
     
     # Load progress
     wallets_generated = load_progress()
@@ -514,21 +525,29 @@ def main_scanner():
         'processed': wallets_generated,
         'rich_found': 0,
         'start_time': time.time(),
-        'last_save': wallets_generated
+        'last_save': wallets_generated,
+        'last_health_check': time.time()
     }
     
     try:
         batch_counter = 0
+        last_progress_update = time.time()
         
         while True:
             batch_counter += 1
+            
+            # Periodic health check setiap 5 menit
+            current_time = time.time()
+            if current_time - stats['last_health_check'] > 300:  # 5 menit
+                simple_health_check()
+                stats['last_health_check'] = current_time
             
             # Generate batch
             batch_numbers = [random.randint(1, 10**30) for _ in range(BATCH_SIZE)]
             
             # Process batch
             batch_start = time.time()
-            batch_results = process_batch(batch_numbers)
+            batch_results = process_batch(batch_numbers, balance_checker)
             batch_time = time.time() - batch_start
             
             # Process results
@@ -549,17 +568,20 @@ def main_scanner():
                         print(f"{'!'*80}\n")
             
             # Display progress
-            display_progress(stats, stats['start_time'], batch_counter)
+            last_progress_update = display_progress(stats, stats['start_time'], batch_counter, last_progress_update)
             
-            # Log batch info
-            if batch_counter % 5 == 0 or batch_time > 30:
+            # Log batch info setiap 3 batch atau jika batch lama
+            if batch_counter % 3 == 0 or batch_time > 20:
                 elapsed = time.time() - stats['start_time']
                 keys_per_sec = stats['processed'] / elapsed if elapsed > 0 else 0
+                
+                with server_cache_lock:
+                    server_count = len(healthy_servers)
                 
                 log_message(
                     f"Batch {batch_counter}: {len(batch_results)} wallets, "
                     f"{batch_rich} rich, time: {batch_time:.1f}s, "
-                    f"total: {stats['processed']:,}, speed: {keys_per_sec:.1f}/s",
+                    f"speed: {keys_per_sec:.1f}/s, servers: {server_count}",
                     "INFO"
                 )
             
@@ -568,8 +590,8 @@ def main_scanner():
                 save_progress(stats['processed'], stats['start_time'])
                 stats['last_save'] = stats['processed']
             
-            # Small delay
-            time.sleep(0.1)
+            # Small delay untuk kontrol CPU
+            time.sleep(0.05)
             
     except KeyboardInterrupt:
         print("\n\n" + "=" * 70)
@@ -597,9 +619,9 @@ def main():
         final_stats = {'processed': 0, 'rich_found': 0, 'start_time': time.time()}
     
     finally:
-        # Stop event loop
-        if main_event_loop and main_event_loop.is_running():
-            main_event_loop.call_soon_threadsafe(main_event_loop.stop)
+        # Cleanup
+        if balance_pool:
+            balance_pool.shutdown()
         
         # Final stats
         print("\n" + "=" * 70)
