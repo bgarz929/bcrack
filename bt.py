@@ -10,6 +10,12 @@ from binascii import hexlify, unhexlify
 from struct import Struct
 import requests
 import json
+import asyncio
+import base58
+import bech32
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
+from functools import partial
 
 from utils import g, b58encode
 
@@ -19,6 +25,9 @@ BATCH_SIZE = 5000                   # Ukuran batch processing
 CHECK_BALANCE = True               # Aktifkan pengecekan balance
 BALANCE_API_TIMEOUT = 5            # Timeout untuk API balance (detik)
 SAVE_INTERVAL = 1000               # Simpan progress setiap 1000 wallet
+USE_ELECTRUM_API = True            # Gunakan Electrum API yang lebih cepat
+ELECTRUM_MAX_CONCURRENT = 8        # Koneksi concurrent ke Electrum
+USE_MULTIPROCESSING = True         # Gunakan multiprocessing untuk balance check
 
 # ========== INISIALISASI ==========
 PACKER = Struct(">QQQQ")            # Untuk konversi 256-bit integer
@@ -30,6 +39,27 @@ WALLETS_FILE = "wallets.txt"        # Semua wallet yang digenerate
 RICH_WALLETS_FILE = "rich_wallets.txt"  # Wallet dengan balance
 LOG_FILE = "scan.log"               # File log aktivitas
 PROGRESS_FILE = "progress.txt"      # Progress checkpoint
+
+# ========== ELECTRUM SERVER LIST ==========
+ELECTRUM_SERVERS = [
+    {"host": "blockitall.us", "port": 50002, "protocol": "ssl"},
+    {"host": "mainnet.foundationdevices.com", "port": 50002, "protocol": "ssl"},
+    {"host": "167.235.9.82", "port": 50002, "protocol": "ssl"},
+    {"host": "btc.electroncash.dk", "port": 60002, "protocol": "ssl"},
+    {"host": "electrum.loyce.club", "port": 50002, "protocol": "ssl"},
+    {"host": "clownshow.fiatfaucet.com", "port": 50002, "protocol": "ssl"},
+    {"host": "molten.tranquille.cc", "port": 50002, "protocol": "ssl"},
+    {"host": "203-132-94-196.ip4.superloop.au", "port": 50002, "protocol": "ssl"},
+    {"host": "tool.sh", "port": 50002, "protocol": "ssl"},
+    {"host": "fulcrum2.not.fyi", "port": 51002, "protocol": "ssl"},
+    {"host": "electrum.cakewallet.com", "port": 50002, "protocol": "ssl"},
+    {"host": "fulcrum.slicksparks.ky", "port": 50002, "protocol": "ssl"},
+    {"host": "electrum.kampfschnitzel.at", "port": 50002, "protocol": "ssl"},
+    {"host": "bitcoin.aranguren.org", "port": 50002, "protocol": "ssl"},
+    {"host": "electrum.sare.red", "port": 50002, "protocol": "ssl"},
+    {"host": "fakenews.fiatfaucet.com", "port": 50002, "protocol": "ssl"},
+    {"host": "blackie.c3-soft.com", "port": 57002, "protocol": "ssl"},
+]
 
 # ========== FUNGSI UTILITAS ==========
 def log_message(message, level="INFO"):
@@ -112,11 +142,148 @@ def pub_key_to_addr(pubkey_hex):
             log_message(f"Address generation failed: {e}", "ERROR")
             return "1ErrorAddress"
 
+# ========== ELECTRUM UTILITIES ==========
+def address_to_scripthash(address: str) -> str:
+    """Convert Bitcoin address to script hash for Electrum API"""
+    try:
+        # Untuk address Bech32 (segwit v0) dan Bech32m (Taproot/segwit v1)
+        if address.startswith("bc1") or address.startswith("tb1"):
+            if address.startswith("bc1"):
+                hrp = "bc"
+            else:
+                hrp = "tb"
+            
+            try:
+                witver, witprog = bech32.decode(hrp, address)
+            except Exception as e:
+                raise ValueError(f"Failed to decode bech32 address: {e}")
+            
+            if witver is None or witprog is None:
+                raise ValueError("Invalid bech32/bech32m address")
+            
+            # Konversi witver/witprog ke script
+            if witver == 0:
+                if len(witprog) == 20:
+                    script = bytes([0x00, 0x14]) + bytes(witprog)
+                elif len(witprog) == 32:
+                    script = bytes([0x00, 0x20]) + bytes(witprog)
+                else:
+                    raise ValueError(f"Invalid witness program length for segwit v0: {len(witprog)}")
+            elif witver == 1:
+                if len(witprog) == 32:
+                    script = bytes([0x51, 0x20]) + bytes(witprog)
+                else:
+                    raise ValueError(f"Invalid witness program length for Taproot: {len(witprog)}")
+            else:
+                if 2 <= len(witprog) <= 40:
+                    script = bytes([0x50 + witver, len(witprog)]) + bytes(witprog)
+                else:
+                    raise ValueError(f"Unsupported witness version: {witver}")
+        else:  # Base58 addresses
+            decoded = base58.b58decode_check(address)
+            ver, payload = decoded[0], decoded[1:]
+            if ver == 0x00:  # P2PKH
+                script = b"\x76\xa9\x14" + payload + b"\x88\xac"
+            elif ver == 0x05:  # P2SH
+                script = b"\xa9\x14" + payload + b"\x87"
+            else:
+                raise ValueError("unknown address version")
+        
+        # Script hash untuk Electrum (SHA256 lalu reverse)
+        scripthash = hashlib.sha256(script).digest()[::-1].hex()
+        return scripthash
+    except Exception as e:
+        raise ValueError(f"address_to_scripthash error for {address}: {e}")
+
+async def check_balance_electrum(address, server_info):
+    """Check balance menggunakan Electrum protocol secara async"""
+    try:
+        import ssl
+        from aiorpcx import connect_rs
+        
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        ssl_context.options |= ssl.OP_ALL
+        ssl_context.set_ciphers('DEFAULT@SECLEVEL=1')
+        
+        async with connect_rs(server_info["host"], server_info["port"], ssl=ssl_context) as session:
+            # Get script hash
+            scripthash = address_to_scripthash(address)
+            
+            # Request balance
+            result = await session.send_request("blockchain.scripthash.get_balance", [scripthash])
+            
+            if isinstance(result, dict):
+                confirmed = result.get("confirmed", 0)
+                unconfirmed = result.get("unconfirmed", 0)
+                total_satoshis = confirmed + unconfirmed
+                return total_satoshis
+            else:
+                return 0
+                
+    except asyncio.TimeoutError:
+        return 0
+    except Exception as e:
+        log_message(f"Electrum error for {address}: {e}", "WARNING")
+        return 0
+
+async def check_balances_batch(addresses, server_info):
+    """Check batch of addresses menggunakan Electrum"""
+    results = {}
+    
+    for address in addresses:
+        balance = await check_balance_electrum(address, server_info)
+        results[address] = balance
+    
+    return results
+
+def check_balances_multiprocess(address_batch):
+    """Check balances menggunakan multiprocessing"""
+    if not USE_ELECTRUM_API or not address_batch:
+        return {addr: 0 for addr in address_batch}
+    
+    try:
+        # Pilih server secara acak
+        server = random.choice(ELECTRUM_SERVERS)
+        
+        # Jalankan async function dalam event loop baru
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        results = loop.run_until_complete(check_balances_batch(address_batch, server))
+        loop.close()
+        
+        return results
+    except Exception as e:
+        log_message(f"Multiprocess balance check error: {e}", "ERROR")
+        return {addr: 0 for addr in address_batch}
+
 # ========== BALANCE CHECKING ==========
 def check_balance_simple(address):
-    """Cek balance Bitcoin address dengan cara sederhana"""
+    """Cek balance Bitcoin address dengan cara sederhana (fallback)"""
+    if not CHECK_BALANCE:
+        return 0
+    
+    if USE_ELECTRUM_API:
+        try:
+            # Gunakan Electrum API
+            server = random.choice(ELECTRUM_SERVERS)
+            
+            # Buat event loop untuk thread ini
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            
+            balance = loop.run_until_complete(check_balance_electrum(address, server))
+            return balance
+        except Exception as e:
+            log_message(f"Electrum check failed for {address}: {e}, falling back...", "WARNING")
+    
+    # Fallback ke blockchain.info API
     try:
-        # Gunakan blockchain.info API
         url = f"https://blockchain.info/balance?active={address}"
         headers = {'User-Agent': 'Mozilla/5.0'}
         
@@ -134,6 +301,27 @@ def check_balance_simple(address):
 
 def check_balance_multiple(address):
     """Cek balance dengan multiple API fallback"""
+    if not CHECK_BALANCE:
+        return 0
+    
+    # Coba Electrum API dulu
+    if USE_ELECTRUM_API:
+        try:
+            server = random.choice(ELECTRUM_SERVERS)
+            
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            
+            balance = loop.run_until_complete(check_balance_electrum(address, server))
+            if balance > 0:
+                return balance
+        except:
+            pass
+    
+    # Fallback ke API lainnya
     apis = [
         f"https://blockchain.info/balance?active={address}",
         f"https://api.blockcypher.com/v1/btc/main/addrs/{address}/balance",
@@ -166,6 +354,72 @@ def check_balance_multiple(address):
     
     return 0
 
+# ========== ADVANCED BALANCE CHECKING ==========
+class ElectrumBalanceChecker:
+    """Class untuk pengecekan balance menggunakan Electrum servers"""
+    
+    def __init__(self, max_workers=None):
+        self.servers = ELECTRUM_SERVERS
+        self.max_workers = max_workers or ELECTRUM_MAX_CONCURRENT
+        self.failed_servers = set()
+        self._lock = threading.Lock()
+        
+    def check_batch_multithread(self, addresses):
+        """Check batch of addresses menggunakan multithreading"""
+        if not addresses or not USE_ELECTRUM_API:
+            return {addr: 0 for addr in addresses}
+        
+        results = {}
+        address_chunks = self._chunk_addresses(addresses)
+        
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {}
+            
+            for chunk in address_chunks:
+                # Pilih server yang belum gagal
+                available_servers = [s for s in self.servers 
+                                   if f"{s['host']}:{s['port']}" not in self.failed_servers]
+                
+                if not available_servers:
+                    available_servers = self.servers
+                
+                server = random.choice(available_servers)
+                future = executor.submit(self._check_chunk_sync, chunk, server)
+                futures[future] = chunk
+            
+            for future in as_completed(futures):
+                chunk = futures[future]
+                try:
+                    chunk_results = future.result(timeout=30)
+                    results.update(chunk_results)
+                except Exception as e:
+                    log_message(f"Chunk check failed: {e}", "WARNING")
+                    # Mark server as failed
+                    with self._lock:
+                        self.failed_servers.add(f"{server['host']}:{server['port']}")
+                    # Set all addresses in chunk to 0
+                    for addr in chunk:
+                        results[addr] = 0
+        
+        return results
+    
+    def _chunk_addresses(self, addresses, chunk_size=50):
+        """Split addresses into chunks"""
+        return [addresses[i:i + chunk_size] for i in range(0, len(addresses), chunk_size)]
+    
+    def _check_chunk_sync(self, addresses, server_info):
+        """Synchronous wrapper untuk async function"""
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            results = loop.run_until_complete(check_balances_batch(addresses, server_info))
+            loop.close()
+            
+            return results
+        except Exception as e:
+            raise e
+
 # ========== WALLET GENERATION ==========
 def generate_wallet(key_number):
     """Generate Bitcoin wallet dari number"""
@@ -193,7 +447,11 @@ def generate_wallet(key_number):
         # 4. Cek Balance jika diaktifkan
         balance = 0
         if CHECK_BALANCE:
-            balance = check_balance_simple(address)
+            if USE_ELECTRUM_API and USE_MULTIPROCESSING:
+                # Gunakan fungsi check_balance_simple yang sudah di-upgrade
+                balance = check_balance_simple(address)
+            else:
+                balance = check_balance_multiple(address)
         
         result = {
             'number': key_number,
@@ -214,17 +472,85 @@ def process_batch(batch_numbers):
     """Process batch of numbers dengan multithreading"""
     results = []
     
-    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        futures = {executor.submit(generate_wallet, num): num for num in batch_numbers}
+    # Jika balance checking diaktifkan dan menggunakan Electrum, 
+    # kita bisa menggunakan ElectrumBalanceChecker untuk batch
+    if CHECK_BALANCE and USE_ELECTRUM_API and len(batch_numbers) > 1:
+        try:
+            # Generate semua wallet terlebih dahulu
+            wallets = []
+            for num in batch_numbers:
+                wallet = generate_wallet(num)
+                if wallet:
+                    wallets.append(wallet)
+            
+            # Check balances dalam batch menggunakan Electrum
+            if wallets and USE_MULTIPROCESSING:
+                addresses = [w['address'] for w in wallets]
+                
+                # Gunakan multiprocessing untuk balance check
+                with ProcessPoolExecutor(max_workers=min(4, multiprocessing.cpu_count())) as executor:
+                    # Split addresses into chunks
+                    chunk_size = max(10, len(addresses) // 4)
+                    chunks = [addresses[i:i + chunk_size] for i in range(0, len(addresses), chunk_size)]
+                    
+                    # Submit chunks for processing
+                    future_to_chunk = {
+                        executor.submit(check_balances_multiprocess, chunk): chunk 
+                        for chunk in chunks
+                    }
+                    
+                    # Collect results
+                    balance_results = {}
+                    for future in as_completed(future_to_chunk):
+                        chunk_results = future.result()
+                        balance_results.update(chunk_results)
+                
+                # Update wallet balances
+                for wallet in wallets:
+                    wallet['balance'] = balance_results.get(wallet['address'], 0)
+                
+                results.extend(wallets)
+            else:
+                # Fallback ke threading biasa
+                with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+                    futures = {executor.submit(generate_wallet, num): num for num in batch_numbers}
+                    
+                    for future in as_completed(futures):
+                        try:
+                            result = future.result(timeout=10)
+                            if result:
+                                results.append(result)
+                        except Exception as e:
+                            num = futures[future]
+                            log_message(f"Timeout/Error for {num}: {e}", "WARNING")
         
-        for future in as_completed(futures):
-            try:
-                result = future.result(timeout=10)
-                if result:
-                    results.append(result)
-            except Exception as e:
-                num = futures[future]
-                log_message(f"Timeout/Error for {num}: {e}", "WARNING")
+        except Exception as e:
+            log_message(f"Batch processing error: {e}, falling back...", "ERROR")
+            # Fallback ke threading biasa
+            with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+                futures = {executor.submit(generate_wallet, num): num for num in batch_numbers}
+                
+                for future in as_completed(futures):
+                    try:
+                        result = future.result(timeout=10)
+                        if result:
+                            results.append(result)
+                    except Exception as e:
+                        num = futures[future]
+                        log_message(f"Timeout/Error for {num}: {e}", "WARNING")
+    else:
+        # Proses normal tanpa optimisasi batch
+        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            futures = {executor.submit(generate_wallet, num): num for num in batch_numbers}
+            
+            for future in as_completed(futures):
+                try:
+                    result = future.result(timeout=10)
+                    if result:
+                        results.append(result)
+                except Exception as e:
+                    num = futures[future]
+                    log_message(f"Timeout/Error for {num}: {e}", "WARNING")
     
     return results
 
@@ -247,7 +573,7 @@ def save_wallet_result(result):
             if result['balance'] > 0:
                 with open(RICH_WALLETS_FILE, "a", encoding="utf-8") as f:
                     f.write(f"{'#'*80}\n")
-                    f.write(f"💰 WALLET DENGAN SALDO DITEMUKAN! 💰\n")
+                    f.write(f"🎯 WALLET DENGAN SALDO DITEMUKAN! 🎯\n")
                     f.write(f"{'#'*80}\n")
                     f.write(f"Number: {result['number']}\n")
                     f.write(f"Private Key: {result['private_key']}\n")
@@ -311,43 +637,40 @@ def print_banner():
     """Tampilkan banner program"""
     os.system('cls' if os.name == 'nt' else 'clear')
     
-    banner = """
-╔══════════════════════════════════════════════════════════════════════╗
-║                                                                      ║
-║  ██████╗  ██████╗ ████████╗ ██████╗ ██████╗  █████╗  ██████╗██╗  ██╗║
-║  ██╔══██╗██╔═══██╗╚══██╔══╝██╔═══██╗██╔══██╗██╔══██╗██╔════╝██║ ██╔╝║
-║  ██████╔╝██║   ██║   ██║   ██║   ██║██████╔╝███████║██║     █████╔╝ ║
-║  ██╔══██╗██║   ██║   ██║   ██║   ██║██╔══██╗██╔══██║██║     ██╔═██╗ ║
-║  ██████╔╝╚██████╔╝   ██║   ╚██████╔╝██║  ██║██║  ██║╚██████╗██║  ██╗║
-║  ╚═════╝  ╚═════╝    ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝║
-║                                                                      ║
-║                BITCOIN WALLET SCANNER v2.0                          ║
-║                Multithreaded + Balance Check                        ║
-║                Author: MMDRZA.COM                                   ║
-║                                                                      ║
-╠══════════════════════════════════════════════════════════════════════╣
-║                                                                      ║
-║  [✓] Mode: Random Scanning                                           ║
-║  [✓] Multithreading: {:<3} threads                                   ║
-║  [✓] Balance Checking: {:<10}                                       ║
-║  [✓] Batch Size: {:<6}                                              ║
-║                                                                      ║
-║  Output Files:                                                       ║
-║    - wallets.txt (all wallets)                                       ║
-║    - rich_wallets.txt (wallets with balance)                         ║
-║                                                                      ║
-║  Press Ctrl+C to stop                                               ║
-║                                                                      ║
-╚══════════════════════════════════════════════════════════════════════╝
-""".format(
-    MAX_THREADS,
-    "ENABLED" if CHECK_BALANCE else "DISABLED",
-    BATCH_SIZE
-)
+    banner = f"""
+╔══════════════════════════════════════════════════════════════════╗
+║                                                                  ║
+║  ██████  ██████  ████████ ██████  ██████  ██ ███    ██ ██████   ║
+║  ██   ██ ██   ██    ██    ██   ██ ██   ██ ██ ████   ██ ██   ██  ║
+║  ██████  ██████     ██    ██████  ██████  ██ ██ ██  ██ ██   ██  ║
+║  ██   ██ ██   ██    ██    ██      ██   ██ ██ ██  ██ ██ ██   ██  ║
+║  ██████  ██   ██    ██    ██      ██   ██ ██ ██   ████ ██████   ║
+║                                                                  ║
+║               BITCOIN WALLET SCANNER v2.1                        ║
+║           Multithreaded + Fast Electrum Balance Check            ║
+║               Author: MMDRZA.COM                                 ║
+║                                                                  ║
+╠══════════════════════════════════════════════════════════════════╣
+║                                                                  ║
+║  [✓] Mode: Random Scanning                                       ║
+║  [✓] Multithreading: {MAX_THREADS:<3} threads                                   ║
+║  [✓] Balance Checking: {("ELECTRUM+" if USE_ELECTRUM_API else "") + ("ENABLED" if CHECK_BALANCE else "DISABLED"):<10}           ║
+║  [✓] Electrum Servers: {len(ELECTRUM_SERVERS):<3}                               ║
+║  [✓] Batch Size: {BATCH_SIZE:<6}                                              ║
+║  [✓] Multiprocessing: {("ENABLED" if USE_MULTIPROCESSING else "DISABLED"):<10}                ║
+║                                                                  ║
+║  Output Files:                                                   ║
+║    - wallets.txt (all wallets)                                   ║
+║    - rich_wallets.txt (wallets with balance)                     ║
+║                                                                  ║
+║  Press Ctrl+C to stop                                           ║
+║                                                                  ║
+╚══════════════════════════════════════════════════════════════════╝
+"""
     
     print(banner)
     print("\n" + "=" * 70)
-    print("Starting random wallet generation with balance checking...")
+    print("Starting random wallet generation with FAST Electrum balance checking...")
     print("=" * 70)
 
 # ========== MAIN SCANNER ==========
@@ -408,7 +731,7 @@ def main_scanner():
                     # Tampilkan alert untuk wallet dengan saldo
                     with print_lock:
                         print(f"\n\n{'!'*80}")
-                        print(f"💰 WALLET DENGAN SALDO DITEMUKAN! 💰")
+                        print(f"🎯 WALLET DENGAN SALDO DITEMUKAN! 🎯")
                         print(f"Address: {result['address']}")
                         print(f"Balance: {result['balance']} satoshi")
                         print(f"{'!'*80}\n")
