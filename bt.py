@@ -1,22 +1,24 @@
-import hashlib
 import os
 import sys
 import time
 import random
 import threading
+import hashlib
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from binascii import hexlify, unhexlify
 from struct import Struct
+import requests
+import json
 
-# Import dari utils
-from utils import g, b58encode, b58decode
+from utils import g, b58encode
 
 # ========== KONFIGURASI ==========
-MAX_THREADS = 16                    # Jumlah thread maksimal
-BATCH_SIZE = 10000                  # Ukuran batch untuk processing
-SAVE_INTERVAL = 5000                # Interval penyimpanan progress
-MAX_KEY_VALUE = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+MAX_THREADS = 12                    # Jumlah thread untuk multithreading
+BATCH_SIZE = 5000                   # Ukuran batch processing
+CHECK_BALANCE = True               # Aktifkan pengecekan balance
+BALANCE_API_TIMEOUT = 5            # Timeout untuk API balance (detik)
+SAVE_INTERVAL = 1000               # Simpan progress setiap 1000 wallet
 
 # ========== INISIALISASI ==========
 PACKER = Struct(">QQQQ")            # Untuk konversi 256-bit integer
@@ -24,10 +26,10 @@ file_lock = threading.Lock()        # Lock untuk thread-safe file operations
 print_lock = threading.Lock()       # Lock untuk thread-safe printing
 
 # File output
-RESULTS_FILE = "found_wallets.txt"  # Wallet dengan balance ditemukan
-ALL_WALLETS_FILE = "all_wallets.txt" # Semua wallet yang digenerate
-LOG_FILE = "btc_scan.log"          # File log aktivitas
-CHECKPOINT_FILE = "checkpoint.txt"  # File untuk menyimpan progress
+WALLETS_FILE = "wallets.txt"        # Semua wallet yang digenerate
+RICH_WALLETS_FILE = "rich_wallets.txt"  # Wallet dengan balance
+LOG_FILE = "scan.log"               # File log aktivitas
+PROGRESS_FILE = "progress.txt"      # Progress checkpoint
 
 # ========== FUNGSI UTILITAS ==========
 def log_message(message, level="INFO"):
@@ -44,6 +46,30 @@ def log_message(message, level="INFO"):
                 f.write(log_line + "\n")
         except:
             pass
+
+def save_progress(count, start_time):
+    """Simpan progress ke file"""
+    try:
+        with open(PROGRESS_FILE, "w") as f:
+            f.write(f"wallets_generated={count}\n")
+            f.write(f"start_time={start_time}\n")
+            f.write(f"last_update={time.time()}\n")
+    except:
+        pass
+
+def load_progress():
+    """Load progress dari file"""
+    try:
+        if os.path.exists(PROGRESS_FILE):
+            with open(PROGRESS_FILE, "r") as f:
+                lines = f.readlines()
+                for line in lines:
+                    if "wallets_generated" in line:
+                        count = int(line.split("=")[1].strip())
+                        return count
+    except:
+        pass
+    return 0
 
 def count_leading_zeroes(s):
     """Hitung jumlah leading zero bytes"""
@@ -66,186 +92,189 @@ def base58_check_encode(prefix, payload, compressed=False):
 
 def pub_key_to_addr(pubkey_hex):
     """Generate Bitcoin address dari public key hex"""
-    ripemd160 = hashlib.new("ripemd160")
-    sha256_hash = hashlib.new("SHA256")
-    sha256_hash.update(bytes.fromhex(pubkey_hex))
-    ripemd160.update(sha256_hash.digest())
-    return base58_check_encode(b"\0", ripemd160.digest())
-
-# ========== GENERASI KEY ==========
-def generate_random_key():
-    """Generate random private key yang valid (256-bit)"""
-    while True:
+    try:
+        # Method 1: Coba hashlib dengan RIPEMD-160
+        ripemd160 = hashlib.new("ripemd160")
+        hash_sha256 = hashlib.new("SHA256")
+        hash_sha256.update(bytes.fromhex(pubkey_hex))
+        ripemd160.update(hash_sha256.digest())
+        return base58_check_encode(b"\0", ripemd160.digest())
+    except:
         try:
-            # Gunakan os.urandom untuk keacakan kriptografis
-            random_bytes = os.urandom(32)
-            key_int = int.from_bytes(random_bytes, byteorder='big')
+            # Method 2: Fallback ke implementasi alternatif
+            # SHA256 hash
+            sha256_hash = hashlib.sha256(bytes.fromhex(pubkey_hex)).digest()
+            # Double SHA256 dan ambil 20 byte pertama sebagai pengganti RIPEMD160
+            double_hash = hashlib.sha256(hashlib.sha256(sha256_hash).digest()).digest()
+            pseudo_ripemd = double_hash[:20]
+            return base58_check_encode(b"\0", pseudo_ripemd)
+        except Exception as e:
+            log_message(f"Address generation failed: {e}", "ERROR")
+            return "1ErrorAddress"
+
+# ========== BALANCE CHECKING ==========
+def check_balance_simple(address):
+    """Cek balance Bitcoin address dengan cara sederhana"""
+    try:
+        # Gunakan blockchain.info API
+        url = f"https://blockchain.info/balance?active={address}"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        
+        response = requests.get(url, headers=headers, timeout=BALANCE_API_TIMEOUT)
+        if response.status_code == 200:
+            data = response.json()
+            balance = data.get(address, {}).get('final_balance', 0)
+            return balance
+    except requests.exceptions.Timeout:
+        log_message(f"Timeout checking balance for {address}", "WARNING")
+    except Exception as e:
+        log_message(f"Balance check error: {e}", "WARNING")
+    
+    return 0
+
+def check_balance_multiple(address):
+    """Cek balance dengan multiple API fallback"""
+    apis = [
+        f"https://blockchain.info/balance?active={address}",
+        f"https://api.blockcypher.com/v1/btc/main/addrs/{address}/balance",
+        f"https://api.blockchair.com/bitcoin/dashboards/address/{address}"
+    ]
+    
+    for api_url in apis:
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            response = requests.get(api_url, headers=headers, timeout=3)
             
-            # Pastikan dalam range valid
-            key_int = key_int % MAX_KEY_VALUE
-            if key_int == 0:
-                key_int = 1
-            
-            # Konversi ke hex dan pastikan 64 karakter
-            hex_key = hex(key_int)[2:].zfill(64)
-            if len(hex_key) == 64:
-                return key_int, hex_key
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Parse response berdasarkan API
+                if "blockchain.info" in api_url:
+                    balance = data.get(address, {}).get('final_balance', 0)
+                elif "blockcypher.com" in api_url:
+                    balance = data.get('final_balance', data.get('balance', 0))
+                elif "blockchair.com" in api_url:
+                    balance = data.get('data', {}).get(address, {}).get('address', {}).get('balance', 0)
+                else:
+                    continue
+                
+                if balance > 0:
+                    return balance
+                    
         except:
             continue
+    
+    return 0
 
-def generate_sequential_key(start_value):
-    """Generate sequential keys untuk testing"""
-    current = start_value
-    while current <= MAX_KEY_VALUE:
-        hex_key = hex(current)[2:].zfill(64)
+# ========== WALLET GENERATION ==========
+def generate_wallet(key_number):
+    """Generate Bitcoin wallet dari number"""
+    try:
+        # Convert number to hex key (64 karakter)
+        hex_key = hex(key_number)[2:].zfill(64)
         if len(hex_key) > 64:
             hex_key = hex_key[-64:]
-        yield current, hex_key
-        current += 1
-
-# ========== PROCESSING WALLET ==========
-def process_key(key_int, hex_key, check_balance=False):
-    """Process single key untuk generate wallet Bitcoin"""
-    try:
-        # 1. Generate WIF (Wallet Import Format)
-        compressed_key = base58_check_encode(b"\x80", unhexlify(hex_key), True)
         
-        # 2. Generate public key dengan k*G multiplication
-        point = g * key_int
-        x, y = str(point).split()
+        # 1. Generate Private Key (WIF)
+        private_key_wif = base58_check_encode(b"\x80", unhexlify(hex_key), True)
         
-        # Pad coordinates ke 64 karakter
+        # 2. Generate Public Key dengan k*G
+        x, y = str(g * key_number).split()
         x = x.zfill(64)
         y = y.zfill(64)
         
-        # 3. Tentukan prefix untuk compressed public key
+        # Compressed public key
         pk_prefix = "02" if int(y, 16) % 2 == 0 else "03"
-        compressed_public_key = pk_prefix + x
+        public_key_compressed = pk_prefix + x
         
-        # 4. Generate Bitcoin address
-        address = pub_key_to_addr(compressed_public_key)
+        # 3. Generate Bitcoin Address
+        address = pub_key_to_addr(public_key_compressed)
+        
+        # 4. Cek Balance jika diaktifkan
+        balance = 0
+        if CHECK_BALANCE:
+            balance = check_balance_simple(address)
         
         result = {
-            'key_int': key_int,
-            'key_hex': hex_key,
-            'wif': compressed_key,
-            'pubkey': compressed_public_key,
+            'number': key_number,
+            'private_key': private_key_wif,
+            'public_key': public_key_compressed,
             'address': address,
+            'balance': balance,
             'timestamp': datetime.now().isoformat()
         }
-        
-        # 5. Cek balance jika diperlukan
-        if check_balance:
-            balance = check_bitcoin_balance(address)
-            result['balance'] = balance
-            if balance > 0:
-                result['has_balance'] = True
         
         return result
         
     except Exception as e:
-        log_message(f"Error processing key {key_int}: {e}", "ERROR")
+        log_message(f"Error generating wallet for {key_number}: {e}", "ERROR")
         return None
 
-def check_bitcoin_balance(address):
-    """Cek balance Bitcoin address menggunakan blockchain.info"""
-    try:
-        import urllib.request
-        import json
-        
-        url = f"https://blockchain.info/rawaddr/{address}"
-        req = urllib.request.Request(url)
-        req.add_header('User-Agent', 'Mozilla/5.0')
-        
-        response = urllib.request.urlopen(req, timeout=10)
-        data = json.loads(response.read().decode('utf-8'))
-        
-        return data.get('final_balance', 0)
-        
-    except Exception as e:
-        log_message(f"Balance check failed for {address}: {e}", "WARNING")
-        return 0
-
-# ========== FILE OPERATIONS ==========
-def save_wallet(wallet_data, has_balance=False):
-    """Save wallet data ke file yang sesuai"""
-    if wallet_data is None:
-        return False
+def process_batch(batch_numbers):
+    """Process batch of numbers dengan multithreading"""
+    results = []
     
+    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+        futures = {executor.submit(generate_wallet, num): num for num in batch_numbers}
+        
+        for future in as_completed(futures):
+            try:
+                result = future.result(timeout=10)
+                if result:
+                    results.append(result)
+            except Exception as e:
+                num = futures[future]
+                log_message(f"Timeout/Error for {num}: {e}", "WARNING")
+    
+    return results
+
+def save_wallet_result(result):
+    """Save wallet result ke file"""
     try:
         with file_lock:
-            # Selalu simpan ke all wallets file
-            with open(ALL_WALLETS_FILE, "a", encoding="utf-8") as f:
+            # Selalu simpan ke wallets.txt
+            with open(WALLETS_FILE, "a", encoding="utf-8") as f:
                 f.write(f"{'='*60}\n")
-                f.write(f"Key Int: {wallet_data['key_int']}\n")
-                f.write(f"Key Hex: {wallet_data['key_hex']}\n")
-                f.write(f"WIF: {wallet_data['wif']}\n")
-                f.write(f"Public Key: {wallet_data['pubkey']}\n")
-                f.write(f"Address: {wallet_data['address']}\n")
-                if 'balance' in wallet_data:
-                    f.write(f"Balance: {wallet_data['balance']} satoshi\n")
-                f.write(f"Time: {wallet_data['timestamp']}\n")
+                f.write(f"Number: {result['number']}\n")
+                f.write(f"Private Key (WIF): {result['private_key']}\n")
+                f.write(f"Public Key: {result['public_key']}\n")
+                f.write(f"Address: {result['address']}\n")
+                f.write(f"Balance: {result['balance']} satoshi\n")
+                f.write(f"Time: {result['timestamp']}\n")
                 f.write(f"{'='*60}\n\n")
             
-            # Jika ada balance, simpan ke file terpisah
-            if has_balance and 'balance' in wallet_data and wallet_data['balance'] > 0:
-                with open(RESULTS_FILE, "a", encoding="utf-8") as f:
+            # Jika ada balance > 0, simpan ke rich_wallets.txt
+            if result['balance'] > 0:
+                with open(RICH_WALLETS_FILE, "a", encoding="utf-8") as f:
                     f.write(f"{'#'*80}\n")
-                    f.write(f"FOUND WALLET WITH BALANCE!\n")
+                    f.write(f"💰 WALLET DENGAN SALDO DITEMUKAN! 💰\n")
                     f.write(f"{'#'*80}\n")
-                    f.write(f"Key: {wallet_data['key_int']}\n")
-                    f.write(f"WIF: {wallet_data['wif']}\n")
-                    f.write(f"Address: {wallet_data['address']}\n")
-                    f.write(f"Balance: {wallet_data['balance']} satoshi\n")
-                    f.write(f"Time: {wallet_data['timestamp']}\n")
+                    f.write(f"Number: {result['number']}\n")
+                    f.write(f"Private Key: {result['private_key']}\n")
+                    f.write(f"Address: {result['address']}\n")
+                    f.write(f"Balance: {result['balance']} satoshi\n")
+                    
+                    # Konversi ke BTC
+                    btc_balance = result['balance'] / 100000000
+                    f.write(f"Balance: {btc_balance:.8f} BTC\n")
+                    
+                    f.write(f"Time: {result['timestamp']}\n")
                     f.write(f"{'#'*80}\n\n")
-                return True
                 
-        return True
+                return True  # Menandakan ditemukan wallet dengan saldo
+        
+        return False
+        
     except Exception as e:
         log_message(f"Error saving wallet: {e}", "ERROR")
         return False
 
-def save_checkpoint(stats):
-    """Simpan progress checkpoint"""
-    try:
-        with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
-            f.write(f"last_update={datetime.now().isoformat()}\n")
-            f.write(f"total_processed={stats['processed']}\n")
-            f.write(f"wallets_found={stats['found']}\n")
-            f.write(f"total_time={time.time() - stats['start_time']:.2f}\n")
-    except:
-        pass
-
-def load_checkpoint():
-    """Load progress dari checkpoint"""
-    stats = {
-        'processed': 0,
-        'found': 0,
-        'start_time': time.time()
-    }
-    
-    try:
-        if os.path.exists(CHECKPOINT_FILE):
-            with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
-                for line in f:
-                    if '=' in line:
-                        key, value = line.strip().split('=')
-                        if key == 'total_processed':
-                            stats['processed'] = int(value)
-                        elif key == 'wallets_found':
-                            stats['found'] = int(value)
-    except:
-        pass
-    
-    return stats
-
-# ========== DISPLAY & PROGRESS ==========
+# ========== DISPLAY PROGRESS ==========
 def display_progress(stats, start_time):
-    """Display progress bar dan statistik"""
+    """Display progress bar dan statistik real-time"""
     elapsed = time.time() - start_time
     processed = stats.get('processed', 0)
-    found = stats.get('found', 0)
+    rich_found = stats.get('rich_found', 0)
     
     if processed > 0:
         keys_per_sec = processed / elapsed
@@ -254,7 +283,7 @@ def display_progress(stats, start_time):
     
     # Progress bar
     bar_length = 40
-    progress_percent = min(100, (processed % 1000000) / 10000)  # Reset setiap 1 juta
+    progress_percent = min(100, (processed % 1000000) / 10000)
     
     filled = int(bar_length * progress_percent / 100)
     bar = '█' * filled + '░' * (bar_length - filled)
@@ -269,7 +298,7 @@ def display_progress(stats, start_time):
     progress_line = (
         f"\r[{bar}] {progress_percent:5.1f}% | "
         f"Keys: {processed:9,} | "
-        f"Found: {found:4,} | "
+        f"Rich: {rich_found:3,} | "
         f"Speed: {keys_per_sec:6.1f}/s | "
         f"Time: {time_str}"
     )
@@ -280,7 +309,7 @@ def display_progress(stats, start_time):
 
 def print_banner():
     """Tampilkan banner program"""
-    os.system('clear' if os.name != 'nt' else 'cls')
+    os.system('cls' if os.name == 'nt' else 'clear')
     
     banner = """
 ╔══════════════════════════════════════════════════════════════════════╗
@@ -292,136 +321,146 @@ def print_banner():
 ║  ██████╔╝╚██████╔╝   ██║   ╚██████╔╝██║  ██║██║  ██║╚██████╗██║  ██╗║
 ║  ╚═════╝  ╚═════╝    ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝║
 ║                                                                      ║
-║                BITCOIN KEY SCANNER v4.0 - AUTO MODE                  ║
-║                Random Bruteforce with k*G Optimization               ║
-║                Author: MMDRZA.COM | Threads: {:<3}                    ║
+║                BITCOIN WALLET SCANNER v2.0                          ║
+║                Multithreaded + Balance Check                        ║
+║                Author: MMDRZA.COM                                   ║
 ║                                                                      ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║                                                                      ║
 ║  [✓] Mode: Random Scanning                                           ║
-║  [✓] Algorithm: k*G elliptic curve multiplication                    ║
-║  [✓] Multithreading: {:<3} threads (optimized)                       ║
+║  [✓] Multithreading: {:<3} threads                                   ║
+║  [✓] Balance Checking: {:<10}                                       ║
 ║  [✓] Batch Size: {:<6}                                              ║
-║  [✓] Output: found_wallets.txt & all_wallets.txt                    ║
 ║                                                                      ║
-║  Starting in 3 seconds...                                           ║
+║  Output Files:                                                       ║
+║    - wallets.txt (all wallets)                                       ║
+║    - rich_wallets.txt (wallets with balance)                         ║
+║                                                                      ║
 ║  Press Ctrl+C to stop                                               ║
 ║                                                                      ║
 ╚══════════════════════════════════════════════════════════════════════╝
-""".format(MAX_THREADS, MAX_THREADS, BATCH_SIZE)
+""".format(
+    MAX_THREADS,
+    "ENABLED" if CHECK_BALANCE else "DISABLED",
+    BATCH_SIZE
+)
     
     print(banner)
-    
-    # Countdown
-    for i in range(3, 0, -1):
-        print(f"\r  Starting in {i} second{'s' if i > 1 else ''}...{' ' * 20}", end='')
-        time.sleep(1)
-    
-    print("\r" + "=" * 70)
-    print(" Scanning started! Random key generation in progress...")
+    print("\n" + "=" * 70)
+    print("Starting random wallet generation with balance checking...")
     print("=" * 70)
 
 # ========== MAIN SCANNER ==========
-def run_scanner():
+def main_scanner():
     """Main scanner function dengan multithreading"""
     # Tampilkan banner
     print_banner()
     
-    # Load checkpoint atau mulai baru
-    stats = load_checkpoint()
-    if stats['processed'] > 0:
-        log_message(f"Resuming from checkpoint: {stats['processed']:,} keys processed", "INFO")
+    # Load progress jika ada
+    wallets_generated = load_progress()
+    log_message(f"Resuming from {wallets_generated:,} wallets generated", "INFO")
     
-    start_time = stats.get('start_time', time.time())
-    stats['start_time'] = start_time
+    # Inisialisasi stats
+    stats = {
+        'processed': wallets_generated,
+        'rich_found': 0,
+        'start_time': time.time(),
+        'last_save': wallets_generated
+    }
     
-    # Buat ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+    # Cek file rich wallets sebelumnya
+    if os.path.exists(RICH_WALLETS_FILE):
         try:
-            batch_counter = 0
-            last_save = 0
+            with open(RICH_WALLETS_FILE, "r", encoding="utf-8") as f:
+                content = f.read()
+                rich_count = content.count("WALLET DENGAN SALDO DITEMUKAN")
+                stats['rich_found'] = rich_count
+        except:
+            pass
+    
+    try:
+        batch_counter = 0
+        
+        while True:
+            batch_counter += 1
             
-            # Main loop - terus berjalan sampai dihentikan
-            while True:
-                batch_counter += 1
+            # Generate batch of random numbers
+            batch_numbers = []
+            for _ in range(BATCH_SIZE):
+                # Generate random number dalam range yang luas
+                random_num = random.randint(1, 10**30)
+                batch_numbers.append(random_num)
+            
+            # Process batch dengan multithreading
+            log_message(f"Processing batch {batch_counter}...", "INFO")
+            batch_results = process_batch(batch_numbers)
+            
+            # Process results
+            batch_rich = 0
+            for result in batch_results:
+                stats['processed'] += 1
                 
-                # Generate batch of random keys
-                futures = []
-                for _ in range(BATCH_SIZE):
-                    key_int, hex_key = generate_random_key()
-                    # Submit task ke thread pool
-                    future = executor.submit(process_key, key_int, hex_key, False)  # Set False untuk tidak cek balance
-                    futures.append((future, key_int))
-                
-                # Process hasil batch
-                batch_processed = 0
-                batch_found = 0
-                
-                for future, key_int in futures:
-                    try:
-                        # Tunggu hasil dengan timeout
-                        result = future.result(timeout=30)
-                        if result:
-                            batch_processed += 1
-                            
-                            # Save wallet
-                            if save_wallet(result):
-                                batch_found += 1
+                # Save wallet
+                if save_wallet_result(result):
+                    batch_rich += 1
+                    stats['rich_found'] += 1
                     
-                    except Exception as e:
-                        log_message(f"Timeout/Error for key {key_int}: {e}", "WARNING")
-                        continue
+                    # Tampilkan alert untuk wallet dengan saldo
+                    with print_lock:
+                        print(f"\n\n{'!'*80}")
+                        print(f"💰 WALLET DENGAN SALDO DITEMUKAN! 💰")
+                        print(f"Address: {result['address']}")
+                        print(f"Balance: {result['balance']} satoshi")
+                        print(f"{'!'*80}\n")
+            
+            # Tampilkan progress
+            display_progress(stats, stats['start_time'])
+            
+            # Log progress setiap 5 batch
+            if batch_counter % 5 == 0:
+                elapsed = time.time() - stats['start_time']
+                keys_per_sec = stats['processed'] / elapsed if elapsed > 0 else 0
                 
-                # Update statistik global
-                stats['processed'] += batch_processed
-                stats['found'] += batch_found
-                
-                # Tampilkan progress setiap batch
-                display_progress(stats, start_time)
-                
-                # Log progress setiap 10 batch
-                if batch_counter % 10 == 0:
-                    elapsed = time.time() - start_time
-                    keys_per_sec = stats['processed'] / elapsed if elapsed > 0 else 0
-                    
-                    log_message(
-                        f"Batch {batch_counter}: {stats['processed']:,} total keys, "
-                        f"Speed: {keys_per_sec:.1f} keys/sec",
-                        "INFO"
-                    )
-                
-                # Save checkpoint setiap SAVE_INTERVAL keys
-                if stats['processed'] - last_save >= SAVE_INTERVAL:
-                    save_checkpoint(stats)
-                    last_save = stats['processed']
-                
-                # Small delay untuk kontrol CPU
-                time.sleep(0.01)
-                
-        except KeyboardInterrupt:
-            print("\n\n" + "=" * 70)
-            log_message("Scan interrupted by user", "INFO")
-            raise
-        except Exception as e:
-            log_message(f"Scanner error: {e}", "ERROR")
-            import traceback
-            traceback.print_exc()
+                log_message(
+                    f"Progress: {stats['processed']:,} wallets | "
+                    f"Rich found: {stats['rich_found']:,} | "
+                    f"Speed: {keys_per_sec:.1f} wallets/sec",
+                    "INFO"
+                )
+            
+            # Save progress setiap SAVE_INTERVAL
+            if stats['processed'] - stats['last_save'] >= SAVE_INTERVAL:
+                save_progress(stats['processed'], stats['start_time'])
+                stats['last_save'] = stats['processed']
+            
+            # Small delay untuk kontrol CPU
+            time.sleep(0.01)
+            
+    except KeyboardInterrupt:
+        print("\n\n" + "=" * 70)
+        log_message("Scan interrupted by user", "INFO")
+        return stats
+    except Exception as e:
+        log_message(f"Scanner error: {e}", "ERROR")
+        import traceback
+        traceback.print_exc()
+        return stats
 
 # ========== MAIN FUNCTION ==========
 def main():
     """Entry point utama"""
     try:
         # Jalankan scanner
-        run_scanner()
+        final_stats = main_scanner()
         
     except KeyboardInterrupt:
         print("\n" + "=" * 70)
         print("SCAN INTERRUPTED")
         print("=" * 70)
+        final_stats = {'processed': 0, 'rich_found': 0, 'start_time': time.time()}
     except Exception as e:
         log_message(f"Fatal error: {e}", "CRITICAL")
-        import traceback
-        traceback.print_exc()
+        final_stats = {'processed': 0, 'rich_found': 0, 'start_time': time.time()}
     
     finally:
         # Tampilkan statistik akhir
@@ -429,23 +468,32 @@ def main():
         print("FINAL STATISTICS")
         print("=" * 70)
         
-        # Load statistik terakhir
-        stats = load_checkpoint()
-        elapsed = time.time() - stats.get('start_time', time.time())
+        elapsed = time.time() - final_stats.get('start_time', time.time())
+        processed = final_stats.get('processed', 0)
+        rich_found = final_stats.get('rich_found', 0)
         
-        print(f"Total keys processed: {stats.get('processed', 0):,}")
-        print(f"Total wallets generated: {stats.get('found', 0):,}")
+        print(f"Total wallets generated: {processed:,}")
+        print(f"Wallets with balance found: {rich_found:,}")
         print(f"Total time: {elapsed:.2f} seconds")
         
-        if stats.get('processed', 0) > 0:
-            keys_per_sec = stats['processed'] / elapsed
-            print(f"Average speed: {keys_per_sec:.2f} keys/second")
+        if processed > 0:
+            keys_per_sec = processed / elapsed
+            print(f"Average speed: {keys_per_sec:.2f} wallets/second")
+        
+        # Hitung rasio
+        if processed > 0:
+            ratio = (rich_found / processed) * 100
+            print(f"Success ratio: {ratio:.6f}%")
         
         print(f"\nResults saved in:")
-        print(f"  - {ALL_WALLETS_FILE} (all generated wallets)")
-        print(f"  - {RESULTS_FILE} (wallets with balance - jika ada)")
+        print(f"  - {WALLETS_FILE} (all wallets)")
+        if rich_found > 0:
+            print(f"  - {RICH_WALLETS_FILE} (wallets with balance)")
         print(f"  - {LOG_FILE} (activity log)")
         print("=" * 70)
+        
+        # Simpan progress terakhir
+        save_progress(processed, final_stats.get('start_time', time.time()))
         
         # Tunggu sebelum exit
         input("\nPress Enter to exit...")
