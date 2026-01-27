@@ -5,7 +5,7 @@ import random
 import threading
 import hashlib
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from binascii import hexlify, unhexlify
 from struct import Struct
 import asyncio
@@ -14,47 +14,45 @@ import bech32
 import ssl
 from aiorpcx import connect_rs
 import socket
+import concurrent.futures
 
 from utils import g, b58encode
 
 # ========== KONFIGURASI ==========
-MAX_THREADS = 8                     # KURANGI dari 12 ke 8 (lebih stabil)
-BATCH_SIZE = 1000                   # KURANGI dari 5000 ke 1000 (batch lebih kecil)
+MAX_THREADS = 8                     # Thread untuk wallet generation
+BATCH_SIZE = 1000                   # Ukuran batch
 CHECK_BALANCE = True               # Aktifkan pengecekan balance
 SAVE_INTERVAL = 1000               # Simpan progress setiap 1000 wallet
-MAX_RETRIES = 1                    # KURANGI retry (1 saja, lebih cepat)
-CONNECTION_TIMEOUT = 5             # KURANGI timeout dari 8 ke 5 detik
-WALLET_TIMEOUT = 8                 # Timeout untuk generate_wallet (detik)
-DISABLE_ELECTRUM_IF_SLOW = True    # Nonaktifkan Electrum jika terlalu lambat
-ELECTRUM_SLOW_THRESHOLD = 10       # Jika >10 detik per wallet, disable
+MAX_RETRIES = 1                    # Retry untuk koneksi
+CONNECTION_TIMEOUT = 5             # Timeout koneksi
+USE_SIMPLE_BALANCE = True          # Gunakan metode simple untuk balance check
 
 # ========== INISIALISASI ==========
-PACKER = Struct(">QQQQ")            # Untuk konversi 256-bit integer
-file_lock = threading.Lock()        # Lock untuk thread-safe file operations
-print_lock = threading.Lock()       # Lock untuk thread-safe printing
+PACKER = Struct(">QQQQ")
+file_lock = threading.Lock()
+print_lock = threading.Lock()
 
 # File output
-WALLETS_FILE = "wallets.txt"        # Semua wallet yang digenerate
-RICH_WALLETS_FILE = "rich_wallets.txt"  # Wallet dengan balance
-LOG_FILE = "scan.log"               # File log aktivitas
-PROGRESS_FILE = "progress.txt"      # Progress checkpoint
+WALLETS_FILE = "wallets.txt"
+RICH_WALLETS_FILE = "rich_wallets.txt"
+LOG_FILE = "scan.log"
+PROGRESS_FILE = "progress.txt"
 
-# ========== ELECTRUM SERVER LIST (SIMPLE) ==========
+# ========== ELECTRUM SERVER LIST ==========
 ELECTRUM_SERVERS = [
     {"host": "bitcoin.aranguren.org", "port": 50002},
     {"host": "electrum.loyce.club", "port": 50002},
-    {"host": "electrum.emzy.de", "port": 50002},  # Server alternatif
-    {"host": "electrum.blockstream.info", "port": 50002},  # Server alternatif
+    {"host": "electrum.emzy.de", "port": 50002},
+    {"host": "electrum.blockstream.info", "port": 50002},
 ]
 
-# ========== SHARED GLOBAL STATE ==========
-healthy_servers = []
-healthy_servers_lock = threading.Lock()
-last_health_check = 0
-HEALTH_CHECK_INTERVAL = 1800  # 30 menit
-electrum_disabled = False  # Flag untuk nonaktifkan Electrum jika lambat
-start_time = time.time()
-wallets_processed = 0
+# ========== GLOBAL EVENT LOOP ==========
+# Buat event loop di main thread
+main_event_loop = None
+server_cache = []
+cache_lock = threading.Lock()
+cache_expiry = 0
+CACHE_DURATION = 300  # 5 menit
 
 # ========== FUNGSI UTILITAS ==========
 def log_message(message, level="INFO"):
@@ -126,19 +124,18 @@ def pub_key_to_addr(pubkey_hex):
         return base58_check_encode(b"\0", ripemd160.digest())
     except:
         try:
-            # Method 2: Fallback ke implementasi alternatif
-            # SHA256 hash
+            # Method 2: Fallback
             sha256_hash = hashlib.sha256(bytes.fromhex(pubkey_hex)).digest()
-            # Double SHA256 dan ambil 20 byte pertama sebagai pengganti RIPEMD160
             double_hash = hashlib.sha256(hashlib.sha256(sha256_hash).digest()).digest()
             pseudo_ripemd = double_hash[:20]
             return base58_check_encode(b"\0", pseudo_ripemd)
         except Exception as e:
-            return "1ErrorAddress"  # Return address error tanpa log
+            log_message(f"Address generation failed: {e}", "ERROR")
+            return "1ErrorAddress"
 
-# ========== ELECTRUM UTILITIES (SIMPLIFIED) ==========
-def address_to_scripthash(address: str) -> str:
-    """Convert Bitcoin address to script hash for Electrum API"""
+# ========== ELECTRUM UTILITIES (FIXED) ==========
+def address_to_scripthash_simple(address: str) -> str:
+    """Convert Bitcoin address to script hash (simplified)"""
     try:
         if address.startswith("1"):  # P2PKH
             decoded = base58.b58decode_check(address)
@@ -148,24 +145,34 @@ def address_to_scripthash(address: str) -> str:
             decoded = base58.b58decode_check(address)
             payload = decoded[1:]
             script = b"\xa9\x14" + payload + b"\x87"
+        elif address.startswith("bc1"):  # Bech32
+            # Simple fallback untuk bech32
+            hrp = "bc"
+            witver, witprog = bech32.decode(hrp, address)
+            if witver == 0:
+                if len(witprog) == 20:
+                    script = bytes([0x00, 0x14]) + bytes(witprog)
+                else:
+                    script = bytes([0x00, 0x20]) + bytes(witprog)
+            else:
+                script = bytes([0x51, 0x20]) + bytes(witprog)
         else:
-            # Untuk simplicity, skip segwit jika complex
-            raise ValueError("Unsupported address type")
+            return "00" * 32
         
         scripthash = hashlib.sha256(script).digest()[::-1].hex()
         return scripthash
-    except:
-        return "00" * 32  # Return dummy scripthash
+    except Exception as e:
+        return "00" * 32
 
 def create_ssl_context():
-    """Create SSL context untuk koneksi Electrum"""
+    """Create SSL context"""
     ssl_context = ssl.create_default_context()
     ssl_context.check_hostname = False
     ssl_context.verify_mode = ssl.CERT_NONE
     return ssl_context
 
-async def check_server_health_quick(server_info):
-    """Cek kesehatan server dengan cepat"""
+async def check_server_health_async(server_info):
+    """Check server health asynchronously"""
     try:
         ssl_context = create_ssl_context()
         async with connect_rs(
@@ -173,8 +180,7 @@ async def check_server_health_quick(server_info):
             server_info["port"], 
             ssl=ssl_context
         ) as session:
-            # Quick ping
-            await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 session.send_request("server.ping", []),
                 timeout=3
             )
@@ -182,51 +188,57 @@ async def check_server_health_quick(server_info):
     except:
         return False
 
-async def quick_health_check():
-    """Health check cepat"""
-    global healthy_servers, last_health_check, electrum_disabled
-    
+async def get_healthy_servers_async():
+    """Get healthy servers asynchronously"""
     tasks = []
     for server in ELECTRUM_SERVERS:
-        task = asyncio.create_task(check_server_health_quick(server))
-        tasks.append((server, task))
+        tasks.append(check_server_health_async(server))
     
-    new_healthy_servers = []
-    for server, task in tasks:
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    healthy = []
+    for i, result in enumerate(results):
+        if result is True:
+            healthy.append(ELECTRUM_SERVERS[i])
+    
+    return healthy
+
+def get_healthy_servers_sync():
+    """Get healthy servers synchronously (run in main event loop)"""
+    global main_event_loop, server_cache, cache_expiry
+    
+    current_time = time.time()
+    
+    # Cek cache
+    with cache_lock:
+        if server_cache and current_time < cache_expiry:
+            return server_cache.copy()
+    
+    # Jika cache expired atau kosong, fetch baru
+    if main_event_loop is None:
+        # Buat event loop jika belum ada
         try:
-            is_healthy = await asyncio.wait_for(task, timeout=5)
-            if is_healthy:
-                new_healthy_servers.append(server)
-        except:
-            continue
+            main_event_loop = asyncio.get_event_loop()
+        except RuntimeError:
+            main_event_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(main_event_loop)
     
-    with healthy_servers_lock:
-        healthy_servers = new_healthy_servers
-        last_health_check = time.time()
-    
-    if not healthy_servers:
-        electrum_disabled = True
-        log_message("⚠️ Semua server Electrum mati, menonaktifkan balance check", "WARNING")
-    else:
-        log_message(f"✅ {len(healthy_servers)} server Electrum siap", "INFO")
+    try:
+        # Jalankan di main event loop
+        healthy_servers = main_event_loop.run_until_complete(get_healthy_servers_async())
+        
+        with cache_lock:
+            server_cache = healthy_servers.copy()
+            cache_expiry = current_time + CACHE_DURATION
+        
+        log_message(f"Found {len(healthy_servers)} healthy servers", "INFO")
+        return healthy_servers
+    except Exception as e:
+        log_message(f"Error getting healthy servers: {e}", "ERROR")
+        return []
 
-def get_healthy_server_fast():
-    """Dapatkan server sehat dengan cepat"""
-    global electrum_disabled
-    
-    if electrum_disabled:
-        return None
-    
-    with healthy_servers_lock:
-        if not healthy_servers:
-            return None
-        return random.choice(healthy_servers)
-
-async def check_balance_fast(address, server_info):
-    """Check balance dengan cepat"""
-    if not server_info:
-        return 0
-    
+async def check_balance_single_async(address, server_info):
+    """Check balance for single address asynchronously"""
     try:
         ssl_context = create_ssl_context()
         async with connect_rs(
@@ -234,7 +246,7 @@ async def check_balance_fast(address, server_info):
             server_info["port"], 
             ssl=ssl_context
         ) as session:
-            scripthash = address_to_scripthash(address)
+            scripthash = address_to_scripthash_simple(address)
             result = await asyncio.wait_for(
                 session.send_request("blockchain.scripthash.get_balance", [scripthash]),
                 timeout=CONNECTION_TIMEOUT
@@ -246,39 +258,48 @@ async def check_balance_fast(address, server_info):
     except:
         return 0
 
-def check_balance_quick(address):
-    """Cek balance dengan cepat (synchronous)"""
-    global electrum_disabled
-    
-    if electrum_disabled or not CHECK_BALANCE:
+def check_balance_single_sync(address):
+    """Check balance synchronously using thread pool"""
+    if not CHECK_BALANCE:
         return 0
     
-    server = get_healthy_server_fast()
-    if not server:
+    healthy_servers = get_healthy_servers_sync()
+    if not healthy_servers:
         return 0
     
+    # Pilih server random
+    server = random.choice(healthy_servers)
+    
+    # Jalankan async function di thread pool
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        balance = loop.run_until_complete(check_balance_fast(address, server))
-        loop.close()
+        if main_event_loop is None:
+            return 0
+        
+        # Submit task ke event loop
+        future = asyncio.run_coroutine_threadsafe(
+            check_balance_single_async(address, server),
+            main_event_loop
+        )
+        
+        # Tunggu hasil dengan timeout
+        balance = future.result(timeout=CONNECTION_TIMEOUT + 2)
         return balance
     except:
         return 0
 
-# ========== WALLET GENERATION (OPTIMIZED) ==========
-def generate_wallet_fast(key_number):
-    """Generate wallet dengan cepat"""
+# ========== WALLET GENERATION ==========
+def generate_wallet(key_number):
+    """Generate Bitcoin wallet dari number"""
     try:
         # Convert number to hex key
         hex_key = hex(key_number)[2:].zfill(64)
         if len(hex_key) > 64:
             hex_key = hex_key[-64:]
         
-        # 1. Private Key
+        # 1. Generate Private Key (WIF)
         private_key_wif = base58_check_encode(b"\x80", unhexlify(hex_key), True)
         
-        # 2. Public Key
+        # 2. Generate Public Key dengan k*G
         x, y = str(g * key_number).split()
         x = x.zfill(64)
         y = y.zfill(64)
@@ -287,19 +308,15 @@ def generate_wallet_fast(key_number):
         pk_prefix = "02" if int(y, 16) % 2 == 0 else "03"
         public_key_compressed = pk_prefix + x
         
-        # 3. Address
+        # 3. Generate Bitcoin Address
         address = pub_key_to_addr(public_key_compressed)
         
-        # 4. Balance check (OPTIONAL - bisa skip jika lambat)
+        # 4. Cek Balance jika diaktifkan
         balance = 0
-        if CHECK_BALANCE and not electrum_disabled:
-            # Coba cek balance, tapi timeout cepat
-            try:
-                balance = check_balance_quick(address)
-            except:
-                balance = 0
+        if CHECK_BALANCE and USE_SIMPLE_BALANCE:
+            balance = check_balance_single_sync(address)
         
-        return {
+        result = {
             'number': key_number,
             'private_key': private_key_wif,
             'public_key': public_key_compressed,
@@ -308,60 +325,87 @@ def generate_wallet_fast(key_number):
             'timestamp': datetime.now().isoformat()
         }
         
+        return result
+        
     except Exception as e:
-        return None  # Skip error, continue
+        log_message(f"Error generating wallet for {key_number}: {e}", "ERROR")
+        return None
 
-def process_batch_fast(batch_numbers):
-    """Process batch dengan timeout management"""
-    global electrum_disabled
-    
+def process_batch(batch_numbers):
+    """Process batch of numbers dengan multithreading"""
     results = []
-    batch_start = time.time()
     
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        futures = {executor.submit(generate_wallet_fast, num): num for num in batch_numbers}
+        futures = {executor.submit(generate_wallet, num): num for num in batch_numbers}
         
         for future in as_completed(futures):
             try:
-                result = future.result(timeout=WALLET_TIMEOUT)
+                result = future.result(timeout=10)
                 if result:
                     results.append(result)
-            except TimeoutError:
-                # Thread timeout, skip wallet ini
-                continue
-            except Exception:
-                # Error lain, continue
-                continue
-    
-    batch_end = time.time()
-    batch_time = batch_end - batch_start
-    avg_time_per_wallet = batch_time / len(batch_numbers) if batch_numbers else 0
-    
-    # Jika terlalu lambat, disable Electrum
-    if (DISABLE_ELECTRUM_IF_SLOW and CHECK_BALANCE and not electrum_disabled and 
-        avg_time_per_wallet > ELECTRUM_SLOW_THRESHOLD):
-        electrum_disabled = True
-        log_message(f"⚠️ Electrum terlalu lambat ({avg_time_per_wallet:.1f}s/wallet), menonaktifkan balance check", "WARNING")
+            except Exception as e:
+                num = futures[future]
+                continue  # Skip error, continue
     
     return results
 
-# ========== PROGRESS DISPLAY ==========
-def display_progress_enhanced(stats, start_time, batch_num, active_threads=0):
-    """Display progress dengan info lebih detail"""
+def save_wallet_result(result):
+    """Save wallet result ke file"""
+    try:
+        with file_lock:
+            # Selalu simpan ke wallets.txt
+            with open(WALLETS_FILE, "a", encoding="utf-8") as f:
+                f.write(f"{'='*60}\n")
+                f.write(f"Number: {result['number']}\n")
+                f.write(f"Private Key (WIF): {result['private_key']}\n")
+                f.write(f"Public Key: {result['public_key']}\n")
+                f.write(f"Address: {result['address']}\n")
+                f.write(f"Balance: {result['balance']} satoshi\n")
+                f.write(f"Time: {result['timestamp']}\n")
+                f.write(f"{'='*60}\n\n")
+            
+            # Jika ada balance > 0, simpan ke rich_wallets.txt
+            if result['balance'] > 0:
+                with open(RICH_WALLETS_FILE, "a", encoding="utf-8") as f:
+                    f.write(f"{'#'*80}\n")
+                    f.write(f"🎯 WALLET DENGAN SALDO DITEMUKAN! 🎯\n")
+                    f.write(f"{'#'*80}\n")
+                    f.write(f"Number: {result['number']}\n")
+                    f.write(f"Private Key: {result['private_key']}\n")
+                    f.write(f"Address: {result['address']}\n")
+                    f.write(f"Balance: {result['balance']} satoshi\n")
+                    
+                    # Konversi ke BTC
+                    btc_balance = result['balance'] / 100000000
+                    f.write(f"Balance: {btc_balance:.8f} BTC\n")
+                    
+                    f.write(f"Time: {result['timestamp']}\n")
+                    f.write(f"{'#'*80}\n\n")
+                
+                return True
+        
+        return False
+        
+    except Exception as e:
+        return False
+
+# ========== DISPLAY PROGRESS ==========
+def display_progress(stats, start_time, batch_num):
+    """Display progress bar dan statistik"""
     elapsed = time.time() - start_time
     processed = stats.get('processed', 0)
     rich_found = stats.get('rich_found', 0)
     
     if processed > 0 and elapsed > 0:
         keys_per_sec = processed / elapsed
-        estimated_total = elapsed / processed if processed > 0 else 0
     else:
         keys_per_sec = 0
-        estimated_total = 0
     
     # Progress bar
     bar_length = 40
-    filled = int(bar_length * (processed % 1000) / 1000)
+    progress_percent = min(100, (processed % 1000) * 100 / 1000)
+    
+    filled = int(bar_length * progress_percent / 100)
     bar = '█' * filled + '░' * (bar_length - filled)
     
     # Format waktu
@@ -370,17 +414,13 @@ def display_progress_enhanced(stats, start_time, batch_num, active_threads=0):
     seconds = int(elapsed % 60)
     time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
     
-    # Status Electrum
-    electrum_status = "✅" if CHECK_BALANCE and not electrum_disabled else "❌"
-    
     # Tampilkan
     progress_line = (
-        f"\r[{bar}] | "
+        f"\r[{bar}] {progress_percent:5.1f}% | "
         f"Batch: {batch_num:3d} | "
-        f"Wallets: {processed:6,} | "
-        f"Rich: {rich_found:3d} | "
-        f"Speed: {keys_per_sec:5.1f}/s | "
-        f"Electrum: {electrum_status} | "
+        f"Wallets: {processed:9,} | "
+        f"Rich: {rich_found:3,} | "
+        f"Speed: {keys_per_sec:6.1f}/s | "
         f"Time: {time_str}"
     )
     
@@ -401,18 +441,18 @@ def print_banner():
 ║  ██   ██ ██   ██    ██    ██      ██   ██ ██ ██  ██ ██ ██   ██  ║
 ║  ██████  ██   ██    ██    ██      ██   ██ ██ ██   ████ ██████   ║
 ║                                                                  ║
-║               BITCOIN WALLET SCANNER v2.6                        ║
-║               FAST MODE - No Stuck Threads                       ║
+║               BITCOIN WALLET SCANNER v3.0                        ║
+║           FIXED Event Loop Management                            ║
 ║               Author: MMDRZA.COM                                 ║
 ║                                                                  ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║                                                                  ║
-║  [✓] Mode: Random Scanning (FAST)                                ║
-║  [✓] Threads: {MAX_THREADS:<2} (optimized)                                     ║
-║  [✓] Batch Size: {BATCH_SIZE:<4} (smaller batches)                          ║
-║  [✓] Balance Check: {("ENABLED" if CHECK_BALANCE else "DISABLED"):<8}                     ║
-║  [✓] Timeout: {WALLET_TIMEOUT}s per wallet                               ║
-║  [✓] Auto-disable Electrum if slow                              ║
+║  [✓] Mode: Random Scanning                                       ║
+║  [✓] Threads: {MAX_THREADS:<3}                                     ║
+║  [✓] Balance Checking: {("ENABLED" if CHECK_BALANCE else "DISABLED"):<10}         ║
+║  [✓] Electrum Servers: {len(ELECTRUM_SERVERS):<3}                               ║
+║  [✓] Batch Size: {BATCH_SIZE:<6}                                  ║
+║  [✓] Timeout: {CONNECTION_TIMEOUT}s                               ║
 ║                                                                  ║
 ║  Press Ctrl+C to stop                                           ║
 ║                                                                  ║
@@ -421,46 +461,45 @@ def print_banner():
     
     print(banner)
     print("\n" + "=" * 70)
-    print("🚀 FAST MODE: Generating wallets with timeout protection...")
+    print("Starting random wallet generation with FIXED event loop...")
     print("=" * 70)
 
 # ========== INITIALIZE ==========
-def initialize_fast():
-    """Initialize cepat"""
-    global CHECK_BALANCE, electrum_disabled
+def initialize():
+    """Initialize program"""
+    global main_event_loop
     
+    log_message("Initializing...", "INFO")
+    
+    # Setup event loop
+    try:
+        main_event_loop = asyncio.get_event_loop()
+    except RuntimeError:
+        main_event_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(main_event_loop)
+    
+    # Health check servers
     if CHECK_BALANCE:
-        try:
-            log_message("Quick Electrum initialization...", "INFO")
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(quick_health_check())
-            loop.close()
-            
-            if electrum_disabled:
-                log_message("⚠️ Running WITHOUT balance checking", "WARNING")
-            else:
-                log_message("✅ Electrum ready", "INFO")
-        except:
-            electrum_disabled = True
-            log_message("⚠️ Electrum init failed, running without balance check", "WARNING")
-    else:
-        log_message("✅ Running without balance checking", "INFO")
+        healthy_servers = get_healthy_servers_sync()
+        if not healthy_servers:
+            log_message("WARNING: No healthy Electrum servers found", "WARNING")
+        else:
+            log_message(f"✅ {len(healthy_servers)} Electrum servers ready", "INFO")
+    
+    log_message("Initialization complete", "INFO")
 
 # ========== MAIN SCANNER ==========
-def main_scanner_fast():
-    """Main scanner fast mode"""
-    global wallets_processed, start_time
-    
+def main_scanner():
+    """Main scanner function"""
     # Tampilkan banner
     print_banner()
     
-    # Initialize cepat
-    initialize_fast()
+    # Initialize
+    initialize()
     
     # Load progress
     wallets_generated = load_progress()
-    log_message(f"Resuming from {wallets_generated:,} wallets", "INFO")
+    log_message(f"Resuming from {wallets_generated:,} wallets generated", "INFO")
     
     # Stats
     stats = {
@@ -470,32 +509,26 @@ def main_scanner_fast():
         'last_save': wallets_generated
     }
     
-    start_time = time.time()
-    
     try:
         batch_counter = 0
         
         while True:
             batch_counter += 1
             
-            # Generate batch kecil
+            # Generate batch
             batch_numbers = [random.randint(1, 10**30) for _ in range(BATCH_SIZE)]
             
-            # Log batch start
-            log_message(f"Batch {batch_counter} started with {BATCH_SIZE} wallets", "INFO")
-            
             # Process batch
+            log_message(f"Processing batch {batch_counter}...", "INFO")
             batch_start = time.time()
-            batch_results = process_batch_fast(batch_numbers)
-            batch_end = time.time()
+            batch_results = process_batch(batch_numbers)
+            batch_time = time.time() - batch_start
             
             # Process results
             batch_rich = 0
             for result in batch_results:
                 stats['processed'] += 1
-                wallets_processed += 1
                 
-                # Save wallet
                 if save_wallet_result(result):
                     batch_rich += 1
                     stats['rich_found'] += 1
@@ -508,12 +541,20 @@ def main_scanner_fast():
                         print(f"Balance: {result['balance']} satoshi")
                         print(f"{'!'*80}\n")
             
-            # Tampilkan progress
-            display_progress_enhanced(stats, start_time, batch_counter)
+            # Display progress
+            display_progress(stats, stats['start_time'], batch_counter)
             
-            # Log batch completion
-            batch_time = batch_end - batch_start
-            log_message(f"Batch {batch_counter} completed: {len(batch_results)} wallets, {batch_rich} rich, time: {batch_time:.1f}s", "INFO")
+            # Log batch info
+            if batch_counter % 5 == 0:
+                elapsed = time.time() - stats['start_time']
+                keys_per_sec = stats['processed'] / elapsed if elapsed > 0 else 0
+                
+                log_message(
+                    f"Batch {batch_counter}: {len(batch_results)} wallets, "
+                    f"{batch_rich} rich, time: {batch_time:.1f}s, "
+                    f"total: {stats['processed']:,}, speed: {keys_per_sec:.1f}/s",
+                    "INFO"
+                )
             
             # Save progress
             if stats['processed'] - stats['last_save'] >= SAVE_INTERVAL:
@@ -529,13 +570,16 @@ def main_scanner_fast():
         return stats
     except Exception as e:
         log_message(f"Scanner error: {e}", "ERROR")
+        import traceback
+        traceback.print_exc()
         return stats
 
-# ========== MAIN ==========
+# ========== MAIN FUNCTION ==========
 def main():
-    """Entry point"""
+    """Entry point utama"""
     try:
-        final_stats = main_scanner_fast()
+        final_stats = main_scanner()
+        
     except KeyboardInterrupt:
         print("\n" + "=" * 70)
         print("SCAN INTERRUPTED")
@@ -546,6 +590,10 @@ def main():
         final_stats = {'processed': 0, 'rich_found': 0, 'start_time': time.time()}
     
     finally:
+        # Cleanup
+        if main_event_loop:
+            main_event_loop.run_until_complete(asyncio.sleep(0.1))
+        
         # Final stats
         print("\n" + "=" * 70)
         print("FINAL STATISTICS")
@@ -563,19 +611,17 @@ def main():
             keys_per_sec = processed / elapsed
             print(f"Average speed: {keys_per_sec:.2f} wallets/second")
         
-        # Simpan progress
-        save_progress(processed, final_stats.get('start_time', time.time()))
-        
-        print("\nResults saved in:")
+        print(f"\nResults saved in:")
         print(f"  - {WALLETS_FILE} (all wallets)")
         if rich_found > 0:
             print(f"  - {RICH_WALLETS_FILE} (wallets with balance)")
         print(f"  - {LOG_FILE} (activity log)")
         print("=" * 70)
         
+        save_progress(processed, final_stats.get('start_time', time.time()))
         input("\nPress Enter to exit...")
 
-# ========== START ==========
+# ========== START PROGRAM ==========
 if __name__ == "__main__":
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     main()
