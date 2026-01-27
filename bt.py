@@ -25,7 +25,7 @@ CHECK_BALANCE = True               # Aktifkan pengecekan balance
 SAVE_INTERVAL = 1000               # Simpan progress setiap 1000 wallet
 USE_ELECTRUM_API = True            # Gunakan Electrum API yang lebih cepat
 ELECTRUM_MAX_CONCURRENT = 8        # Koneksi concurrent ke Electrum
-USE_MULTIPROCESSING = True         # Gunakan multiprocessing untuk balance check
+USE_MULTIPROCESSING = False        # Nonaktifkan multiprocessing karena kompleks
 MAX_RETRIES = 2                    # Maksimal retry untuk koneksi Electrum
 CONNECTION_TIMEOUT = 8             # Timeout koneksi Electrum (detik)
 
@@ -609,6 +609,7 @@ def initialize_electrum_checker():
         
         if not success:
             log_message("WARNING: Electrum checker initialization failed. Balance checking may not work.", "WARNING")
+            return False
         
         return success
     except Exception as e:
@@ -621,11 +622,13 @@ def main_scanner():
     # Tampilkan banner
     print_banner()
     
+    # Declare CHECK_BALANCE as global at the beginning of the function
+    global CHECK_BALANCE
+    
     # Initialize Electrum checker
     if CHECK_BALANCE:
         if not initialize_electrum_checker():
             log_message("Continuing without balance checking...", "WARNING")
-            global CHECK_BALANCE
             CHECK_BALANCE = False
     
     # Load progress jika ada
