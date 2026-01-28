@@ -1,190 +1,207 @@
 import os
 import sys
 import time
-import random
 import hashlib
-import requests
+import asyncio
+import ssl
+import random
 import base58
-import threading
 from multiprocessing import Process, Queue, cpu_count, Event, Value
 from ecdsa import SECP256k1, SigningKey
-from datetime import datetime
+from aiorpcx import connect_rs
 
 # ========== KONFIGURASI ==========
-NUM_PROCESSES = max(1, cpu_count() - 1)  # Gunakan semua core kecuali 1
-CHECK_BALANCE = True                     # Set False jika hanya ingin generate offline (sangat cepat)
+NUM_PROCESSES = max(1, cpu_count() - 1)
+BATCH_SIZE = 50  # Jumlah wallet yang dicek dalam sekali request (Efisiensi Electrum)
 RICH_LOG_FILE = "found_rich.txt"
-WALLETS_LOG_FILE = "generated_wallets.txt"
 
-# ========== API PROVIDERS (Load Balancer) ==========
-# Kita merotasi API untuk menghindari Rate Limit
-API_SOURCES = [
-    "https://blockchain.info/q/addressbalance/{}",
-    "https://mempool.space/api/address/{}/utxo",  # Mempool returns list, need parsing
-    "https://blockstream.info/api/address/{}/utxo"
-]
+# ========== 1. MODUL KRIPTOGRAFI (Dari bck.py) ==========
 
-# ========== FUNGSI KRIPTOGRAFI (Bitcoin Standard) ==========
-
-def generate_private_key():
-    """Generate random private key hex 32 bytes"""
-    return os.urandom(32).hex()
-
-def private_key_to_wif(private_key_hex, compressed=True):
-    """Convert Hex Private Key ke WIF (Wallet Import Format)"""
-    extended_key = b"\x80" + bytes.fromhex(private_key_hex)
-    if compressed:
-        extended_key += b"\x01"
+def generate_key_pair():
+    """Generate Private Key, WIF, dan Address sekaligus"""
+    # 1. Private Key
+    priv_bytes = os.urandom(32)
+    priv_hex = priv_bytes.hex()
     
-    first_sha = hashlib.sha256(extended_key).digest()
-    second_sha = hashlib.sha256(first_sha).digest()
-    checksum = second_sha[:4]
+    # 2. WIF (Compressed)
+    extended_key = b"\x80" + priv_bytes + b"\x01"
+    checksum = hashlib.sha256(hashlib.sha256(extended_key).digest()).digest()[:4]
+    wif = base58.b58encode(extended_key + checksum).decode('utf-8')
     
-    wif = base58.b58encode(extended_key + checksum)
-    return wif.decode('utf-8')
-
-def private_key_to_public_key(private_key_hex, compressed=True):
-    """Generate Public Key dari Private Key menggunakan kurva SECP256k1"""
-    sk = SigningKey.from_string(bytes.fromhex(private_key_hex), curve=SECP256k1)
+    # 3. Public Key (Compressed)
+    sk = SigningKey.from_string(priv_bytes, curve=SECP256k1)
     vk = sk.verifying_key
+    x_str = vk.to_string()[:32]
+    y_str = vk.to_string()[32:]
     
-    if compressed:
-        from ecdsa.util import sigencode_string
-        # Compressed public key format:
-        # 0x02 + x (jika y genap) ATAU 0x03 + x (jika y ganjil)
-        x_str = vk.to_string()[:32]
-        y_str = vk.to_string()[32:]
-        if int.from_bytes(y_str, byteorder='big') % 2 == 0:
-            return (b'\x02' + x_str).hex()
-        else:
-            return (b'\x03' + x_str).hex()
+    if int.from_bytes(y_str, byteorder='big') % 2 == 0:
+        pub_key_bytes = b'\x02' + x_str
     else:
-        return (b'\x04' + vk.to_string()).hex()
-
-def public_key_to_address(public_key_hex):
-    """Convert Public Key Hex ke Bitcoin Address (P2PKH)"""
-    public_key_bytes = bytes.fromhex(public_key_hex)
-    
-    # 1. SHA-256
-    sha256_bpk = hashlib.sha256(public_key_bytes).digest()
-    
-    # 2. RIPEMD-160
+        pub_key_bytes = b'\x03' + x_str
+        
+    # 4. Address P2PKH
+    sha256_bpk = hashlib.sha256(pub_key_bytes).digest()
     ripemd160_bpk = hashlib.new('ripemd160')
     ripemd160_bpk.update(sha256_bpk)
-    ripemd160_bpk_digest = ripemd160_bpk.digest()
+    ripemd160_digest = ripemd160_bpk.digest()
     
-    # 3. Add Network Byte (0x00 for Mainnet)
-    network_byte = b'\x00' + ripemd160_bpk_digest
+    network_byte = b'\x00' + ripemd160_digest
+    checksum_addr = hashlib.sha256(hashlib.sha256(network_byte).digest()).digest()[:4]
+    address = base58.b58encode(network_byte + checksum_addr).decode('utf-8')
     
-    # 4. Double SHA-256 for Checksum
-    sha256_nb = hashlib.sha256(network_byte).digest()
-    sha256_2_nb = hashlib.sha256(sha256_nb).digest()
-    checksum = sha256_2_nb[:4]
-    
-    # 5. Base58 Encode
-    address = base58.b58encode(network_byte + checksum)
-    return address.decode('utf-8')
+    return priv_hex, wif, address
 
-# ========== BALANCER CHECKER ==========
+# ========== 2. MODUL ELECTRUM (Dari cebb.py) ==========
 
-def check_balance(address):
-    """Check balance dengan rotasi API dan Error Handling"""
-    if not CHECK_BALANCE:
-        return 0
-    
-    # Randomly pick API source to distribute load
-    source = random.choice(API_SOURCES)
-    url = source.format(address)
-    
+def address_to_scripthash(address):
+    """Mengubah address menjadi scripthash untuk query Electrum"""
     try:
-        response = requests.get(url, timeout=5)
-        
-        if response.status_code == 200:
-            # Handle Blockchain.info (returns raw integer)
-            if "blockchain.info" in url:
-                return int(response.text)
-            
-            # Handle Mempool/Blockstream (returns JSON UTXO list)
-            elif "utxo" in url:
-                data = response.json()
-                total_sats = sum([utxo['value'] for utxo in data])
-                return total_sats
-                
-        # Jika gagal atau rate limit, kembalikan 0 (atau bisa ditambahkan logic retry)
-        return 0
-        
+        decoded = base58.b58decode_check(address)
+        ver, payload = decoded[0], decoded[1:]
+        if ver == 0x00:  # P2PKH
+            script = b"\x76\xa9\x14" + payload + b"\x88\xac"
+        elif ver == 0x05: # P2SH
+            script = b"\xa9\x14" + payload + b"\x87"
+        else:
+            return None
+        return hashlib.sha256(script).digest()[::-1].hex()
     except Exception:
-        return 0
+        return None
 
-# ========== WORKER PROCESS ==========
+class FastElectrumServerManager:
+    """Manajemen koneksi server Electrum (Diambil dari cebb.py)"""
+    def __init__(self):
+        self.servers = [
+            {"host": "blockitall.us", "port": 50002},
+            {"host": "electrum.loyce.club", "port": 50002},
+            {"host": "electrum.cakewallet.com", "port": 50002},
+            {"host": "electrum.blockstream.info", "port": 50002},
+            {"host": "btc.electroncash.dk", "port": 60002},
+        ]
+        self._ssl_context = ssl.create_default_context()
+        self._ssl_context.check_hostname = False
+        self._ssl_context.verify_mode = ssl.CERT_NONE
 
-def worker(queue, found_event, counter_val):
-    """Fungsi yang dijalankan oleh setiap Core CPU"""
-    sys.stdout.flush()
+    def get_random_server(self):
+        return random.choice(self.servers)
+
+class FastElectrumClient:
+    """Client Async untuk cek balance (Versi ringan dari cebb.py)"""
+    def __init__(self, server_manager):
+        self.manager = server_manager
+
+    async def get_balance_batch(self, addresses_map):
+        """
+        Cek balance banyak address sekaligus dalam satu koneksi.
+        addresses_map: Dict {address: wif}
+        """
+        results = {}
+        server = self.manager.get_random_server()
+        
+        try:
+            async with connect_rs(server["host"], server["port"], ssl=self.manager._ssl_context) as session:
+                # Kirim request secara parallel (gather)
+                tasks = []
+                addr_list = list(addresses_map.keys())
+                
+                for addr in addr_list:
+                    scripthash = address_to_scripthash(addr)
+                    if scripthash:
+                        # Request Electrum: blockchain.scripthash.get_balance
+                        tasks.append(session.send_request("blockchain.scripthash.get_balance", [scripthash]))
+                    else:
+                        tasks.append(None) # Invalid address handling
+
+                # Tunggu semua jawaban
+                responses = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                for i, resp in enumerate(responses):
+                    if isinstance(resp, dict):
+                        # Electrum response: {'confirmed': 0, 'unconfirmed': 0}
+                        total = resp.get("confirmed", 0) + resp.get("unconfirmed", 0)
+                        if total > 0:
+                            addr = addr_list[i]
+                            results[addr] = total
+        except Exception:
+            # Jika server error, return kosong (akan diskip batch ini, atau bisa diretry)
+            pass
+            
+        return results
+
+# ========== 3. WORKER LOGIC (Digabungkan) ==========
+
+async def async_worker_loop(queue, found_event, counter):
+    """Loop utama worker dalam mode Async"""
+    server_manager = FastElectrumServerManager()
+    client = FastElectrumClient(server_manager)
     
     while not found_event.is_set():
         try:
-            # 1. Generate Keys
-            priv_hex = generate_private_key()
-            wif = private_key_to_wif(priv_hex, compressed=True)
-            pub_hex = private_key_to_public_key(priv_hex, compressed=True)
-            address = public_key_to_address(pub_hex)
+            # 1. Generate Batch Addresses
+            # Kita generate BATCH_SIZE (misal 50) sekaligus
+            batch_data = {} # {address: wif}
             
-            # 2. Check Balance
-            balance = 0
-            if CHECK_BALANCE:
-                balance = check_balance(address)
+            for _ in range(BATCH_SIZE):
+                priv, wif, addr = generate_key_pair()
+                batch_data[addr] = wif
             
-            # 3. Kirim ke Main Process jika ada hasil menarik
-            # Simpan log setiap wallet (opsional, hati-hati file size meledak)
-            # Untuk efisiensi, kita hanya kirim data ke queue display setiap 50 generate
+            # 2. Cek Balance via Electrum (Cepat!)
+            # Ini menggantikan check_balance() lama yang satu-satu
+            found_balances = await client.get_balance_batch(batch_data)
             
-            with counter_val.get_lock():
-                counter_val.value += 1
+            # 3. Proses Hasil
+            with counter.get_lock():
+                counter.value += BATCH_SIZE
                 
-            if balance > 0:
-                result = {
-                    "type": "RICH",
-                    "address": address,
-                    "private_key": wif,
-                    "balance": balance
-                }
-                queue.put(result)
-                
-            # Uncomment baris bawah jika ingin menyimpan SEMUA wallet (sangat memperlambat disk I/O)
-            # else:
-            #     queue.put({"type": "NORMAL", "address": address, "wif": wif})
-            
+            for addr, balance in found_balances.items():
+                if balance > 0:
+                    wif = batch_data[addr]
+                    result = {
+                        "type": "RICH",
+                        "address": addr,
+                        "wif": wif,
+                        "balance": balance
+                    }
+                    queue.put(result)
+                    found_event.set() # Stop semua jika ketemu (opsional)
+
         except Exception as e:
+            await asyncio.sleep(1) # Tunggu sebentar jika error network
             continue
 
-# ========== MAIN MONITOR ==========
+def worker_wrapper(queue, found_event, counter):
+    """Wrapper untuk menjalankan Asyncio di dalam Multiprocessing"""
+    # Windows fix untuk event loop policy
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        
+    asyncio.run(async_worker_loop(queue, found_event, counter))
+
+# ========== 4. MAIN MONITOR ==========
 
 def print_banner():
     os.system('cls' if os.name == 'nt' else 'clear')
     print(f"""
     ╔══════════════════════════════════════════════════════════╗
-    ║             BITCOIN HUNTER OPTIMIZED v4.0                ║
-    ║        Multi-Process & Valid Cryptography Engine         ║
+    ║        BITCOIN HUNTER x ELECTRUM UPGRADED v5.0           ║
+    ║      Engine: Async Electrum Protocol (TCP/SSL)           ║
     ╚══════════════════════════════════════════════════════════╝
-    [+] CPU Cores    : {cpu_count()} Detected
-    [+] Workers      : {NUM_PROCESSES} Active
-    [+] Balance Check: {'ENABLED' if CHECK_BALANCE else 'DISABLED'}
-    [+] Output File  : {RICH_LOG_FILE}
+    [+] Cores        : {cpu_count()}
+    [+] Workers      : {NUM_PROCESSES}
+    [+] Batch Size   : {BATCH_SIZE} wallets/request
+    [+] Output       : {RICH_LOG_FILE}
     """)
 
 def main():
     print_banner()
     
-    # Shared variables antar proses
     result_queue = Queue()
     found_event = Event()
     counter = Value('i', 0)
     
-    # Start Worker Processes
     processes = []
     for _ in range(NUM_PROCESSES):
-        p = Process(target=worker, args=(result_queue, found_event, counter))
+        p = Process(target=worker_wrapper, args=(result_queue, found_event, counter))
         p.start()
         processes.append(p)
     
@@ -192,47 +209,37 @@ def main():
     
     try:
         while True:
-            # Update Display
             time.sleep(1)
             elapsed = time.time() - start_time
             total = counter.value
             speed = total / elapsed if elapsed > 0 else 0
             
             sys.stdout.write(
-                f"\r[*] Scanned: {total:,} Wallets | "
-                f"Speed: {speed:.2f} keys/sec | "
-                f"Time: {elapsed:.1f}s"
+                f"\r[*] Scan: {total:,} Keys | Speed: {speed:.2f} Keys/s | Found: {result_queue.qsize()} "
             )
             sys.stdout.flush()
             
-            # Check Queue for Results
             while not result_queue.empty():
                 data = result_queue.get()
-                
-                if data['type'] == 'RICH':
-                    print("\n\n" + "!"*50)
-                    print(f" [SUCCESS] FOUND BALANCE!")
-                    print(f" Address : {data['address']}")
-                    print(f" PrivKey : {data['private_key']}")
-                    print(f" Balance : {data['balance']} sats")
-                    print("!"*50 + "\n")
+                msg = (f"\n\n[!!!] JACKPOT FOUND [!!!]\n"
+                       f"Address: {data['address']}\n"
+                       f"WIF    : {data['wif']}\n"
+                       f"Balance: {data['balance']} Sats\n"
+                       f"{'-'*40}\n")
+                print(msg)
+                with open(RICH_LOG_FILE, "a") as f:
+                    f.write(f"Address: {data['address']} | WIF: {data['wif']} | Bal: {data['balance']}\n")
                     
-                    with open(RICH_LOG_FILE, "a") as f:
-                        f.write(f"Address: {data['address']} | Key: {data['private_key']} | Bal: {data['balance']}\n")
-                        
     except KeyboardInterrupt:
-        print("\n\n[!] Stopping all workers...")
+        print("\nStopping...")
         found_event.set()
         for p in processes:
             p.terminate()
-        print("[!] Cleanup complete. Goodbye.")
 
 if __name__ == "__main__":
-    # Windows fix untuk multiprocessing
     try:
         import multiprocessing
         multiprocessing.freeze_support()
     except:
         pass
-        
     main()
