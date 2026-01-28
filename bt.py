@@ -57,7 +57,25 @@ ELECTRUM_SERVERS = [
     ("ssl.mercurywallet.com", 50002),
 ]
 
-# ========== 2. GENERATOR KEY ==========
+# Daftar Alamat Test (Untuk memastikan Server berfungsi)
+TEST_ADDRESSES = [
+    "12tkqA9xSoowkzoERHMWNKsTey55YEBqkv",
+    "1PeizMg76Cf96nUQrYg8xuoZWLQozU5zGW",
+    "1f1miYFQWTzdLiCBxtHHnNiW7WAWPUccr",
+    "1BAFWQhH9pNkz3mZDQ1tWrtKkSHVCkc3fV",
+    "14YK4mzJGo5NKkNnmVJeuEAQftLt795Gec",
+    "1KbrSKrT3GeEruTuuYYUSQ35JwKbrAWJYm"
+]
+
+# ========== 2. FUNGSI KONVERSI ==========
+
+def address_to_scripthash(address):
+    try:
+        decoded = base58.b58decode_check(address)
+        if decoded[0] != 0: return None 
+        script = b'\x76\xa9\x14' + decoded[1:] + b'\x88\xac'
+        return hashlib.sha256(script).digest()[::-1].hex()
+    except: return None
 
 def generate_key_pair():
     priv_bytes = os.urandom(32)
@@ -81,15 +99,62 @@ def generate_key_pair():
     
     return wif, address
 
-# ========== 3. ENGINE ELECTRUM ==========
+# ========== 3. FITUR STARTUP SELF-TEST (BARU) ==========
 
-def address_to_scripthash(address):
-    try:
-        decoded = base58.b58decode_check(address)
-        if decoded[0] != 0: return None 
-        script = b'\x76\xa9\x14' + decoded[1:] + b'\x88\xac'
-        return hashlib.sha256(script).digest()[::-1].hex()
-    except: return None
+async def run_startup_test():
+    """Fungsi ini berjalan SATU KALI di awal untuk cek koneksi & akurasi"""
+    print("\n🔍 MELAKUKAN SELF-DIAGNOSTIC (CEK SERVER & SALDO VALID)...")
+    print("="*80)
+    
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+    
+    # Coba konek ke salah satu server
+    connected = False
+    for server in ELECTRUM_SERVERS:
+        host, port = server
+        try:
+            print(f"⌛ Menghubungkan ke {host}...", end="\r")
+            async with connect_rs(host, port, ssl=ssl_ctx) as session:
+                print(f"✅ Terhubung ke {host} [OK]                  ")
+                print("-" * 80)
+                
+                # Test Semua Alamat dalam Daftar
+                for addr in TEST_ADDRESSES:
+                    sh = address_to_scripthash(addr)
+                    if not sh:
+                        print(f"❌ Invalid Address format: {addr}")
+                        continue
+                        
+                    # Request Saldo Real
+                    res = await session.send_request('blockchain.scripthash.get_balance', [sh])
+                    
+                    bal_conf = res.get('confirmed', 0)
+                    bal_unconf = res.get('unconfirmed', 0)
+                    total_bal = bal_conf + bal_unconf
+                    
+                    # Convert ke BTC untuk display enak dilihat
+                    btc_bal = total_bal / 100000000
+                    
+                    status = "✅ PASS" if total_bal >= 0 else "❌ FAIL"
+                    print(f"[{status}] {addr[:15]}... | Balance: {total_bal:>16,} Sats ({btc_bal:.4f} BTC)")
+                
+                connected = True
+                break # Jika satu server berhasil, stop loop server
+        except Exception as e:
+            print(f"⚠️  Gagal ke {host}: {str(e)}")
+            continue
+            
+    print("="*80)
+    if not connected:
+        print("❌ SEMUA KONEKSI SERVER GAGAL. PERIKSA INTERNET ANDA!")
+        sys.exit(1)
+    else:
+        print("🚀 DIAGNOSTIK SELESAI. SISTEM SIAP. MEMULAI BRUTEFORCE DALAM 3 DETIK...")
+        time.sleep(3)
+
+# ========== 4. WORKER LOGIC (MATRIX MODE) ==========
 
 async def worker_logic(queue, counter, display_queue):
     ssl_ctx = ssl.create_default_context()
@@ -113,31 +178,24 @@ async def worker_logic(queue, counter, display_queue):
                         if sh:
                             batch_data[addr] = wif
                             batch_scripthashes.append((addr, sh))
-                            last_sample = (addr, wif) # Simpan sampel terakhir untuk ditampilkan
+                            last_sample = (addr, wif)
                     
                     requests = []
                     for _, sh in batch_scripthashes:
                         requests.append(session.send_request('blockchain.scripthash.get_balance', [sh]))
                     
-                    # Tunggu hasil dari server
                     results = await asyncio.wait_for(asyncio.gather(*requests, return_exceptions=True), timeout=10)
                     
-                    # --- KIRIM DATA KE LAYAR (STREAMING LOG) ---
-                    # Kita kirim sampel terakhir dari batch ini untuk ditampilkan di log
-                    # agar user tahu proses berjalan dan hasilnya 0
+                    # Stream log
                     if last_sample and not display_queue.full():
-                         # Format: (Addr, WIF, Balance_Status)
-                         # Kita asumsikan 0 dulu untuk log cepat, jika jackpot nanti akan ditangkap di bawah
                          try:
                              display_queue.put_nowait((last_sample[0], last_sample[1], 0))
                          except: pass
-                    # -------------------------------------------
 
                     for i, res in enumerate(results):
                         if isinstance(res, dict):
                             bal = res.get('confirmed', 0) + res.get('unconfirmed', 0)
                             if bal > 0:
-                                # JACKPOT!
                                 addr = batch_scripthashes[i][0]
                                 queue.put((addr, batch_data[addr], bal))
                         
@@ -145,7 +203,6 @@ async def worker_logic(queue, counter, display_queue):
                         counter.value += BATCH_SIZE
                         
         except Exception:
-            # await asyncio.sleep(1) # Silent retry
             continue
 
 def process_entry(queue, counter, display_queue):
@@ -156,23 +213,26 @@ def process_entry(queue, counter, display_queue):
     except KeyboardInterrupt:
         pass
 
-# ========== 4. MAIN UI (STREAMING MODE) ==========
+# ========== 5. MAIN PROGRAM ==========
 
 def main():
     os.system('cls' if os.name == 'nt' else 'clear')
     print(f"""
     ╔═════════════════════════════════════════════════════════╗
-    ║           BITCOIN HUNTER - MATRIX LOG v9                ║
+    ║        BITCOIN HUNTER - DIAGNOSTIC & MATRIX v10         ║
     ╚═════════════════════════════════════════════════════════╝
-    [+] Workers    : {NUM_PROCESSES}
-    [+] Mode       : FULL STREAMING (Show Process & Result)
     """)
+    
+    # --- JALANKAN TEST PENGECEKAN BALANCE DULU ---
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    asyncio.run(run_startup_test())
+    # ---------------------------------------------
     
     print(f"{'STATUS':<10} | {'ADDRESS':<34} | {'PRIVATE KEY (WIF)':<52}")
     print("="*100)
     
     result_queue = Queue()
-    # Queue display agak besar biar menampung stream
     display_queue = Queue(maxsize=100) 
     counter = Value('i', 0)
     
@@ -187,30 +247,14 @@ def main():
     
     try:
         while True:
-            # Ambil data dari display queue dan print
             try:
-                # Print max 20 baris per detik agar terminal tidak hang tapi tetap cepat
                 for _ in range(20): 
                     if not display_queue.empty():
                         d_addr, d_wif, d_bal = display_queue.get_nowait()
-                        
-                        # Format Status: [0 SATS] atau [ERROR]
-                        status_str = f"[{d_bal} SATS]"
-                        
-                        # Print Full Line
-                        print(f"{status_str:<10} | {d_addr:<34} | {d_wif}")
-                
-                # Update info speed sesekali (tidak perlu setiap saat agar tidak merusak log)
-                elapsed = time.time() - start_time
-                if elapsed > 0 and counter.value % 500 == 0:
-                     # Tidak print speed di baris baru agar tidak spam, tapi judul window atau footer kalau bisa
-                     # Disini kita biarkan scrolling log mendominasi
-                     pass
-
+                        print(f"[{d_bal} SATS]  | {d_addr:<34} | {d_wif}")
             except Exception:
                 pass
             
-            # Cek Jackpot (Prioritas Utama)
             while not result_queue.empty():
                 addr, wif, bal = result_queue.get()
                 print("\n" + "█"*100)
@@ -223,7 +267,6 @@ def main():
                 with open(RICH_LOG_FILE, "a") as f:
                     f.write(f"ADDR: {addr} | WIF: {wif} | BAL: {bal}\n")
             
-            # Istirahat sangat sebentar agar CPU UI tidak 100%
             time.sleep(0.01)
                     
     except KeyboardInterrupt:
