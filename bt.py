@@ -10,7 +10,7 @@ import base58
 from multiprocessing import Process, Queue, cpu_count, Value
 from ecdsa import SECP256k1, SigningKey
 
-# ========== CEK DEPENDENCIES & HASH FIX (Sama seperti v6) ==========
+# ========== 1. CEK DEPENDENCIES & HASH FIX (RIPEMD160) ==========
 def get_ripemd160_hasher():
     try:
         hashlib.new('ripemd160')
@@ -58,7 +58,7 @@ ELECTRUM_SERVERS = [
     ("electrum.jochen-hoenicke.de", 50002),
 ]
 
-# ========== 1. GENERATOR ==========
+# ========== 2. GENERATOR KEY ==========
 
 def generate_key_pair():
     priv_bytes = os.urandom(32)
@@ -83,7 +83,7 @@ def generate_key_pair():
     
     return wif, address
 
-# ========== 2. ENGINE ELECTRUM ==========
+# ========== 3. ENGINE ELECTRUM ==========
 
 def address_to_scripthash(address):
     try:
@@ -118,7 +118,6 @@ async def worker_logic(queue, counter, monitor_queue):
                             last_wif, last_addr = wif, addr
                     
                     # --- FITUR VISUAL ---
-                    # Kirim sample ke layar (hanya jika queue kosong agar tidak lag)
                     if not monitor_queue.full():
                         try:
                             monitor_queue.put_nowait((last_addr, last_wif))
@@ -152,21 +151,19 @@ def process_entry(queue, counter, monitor_queue):
     except KeyboardInterrupt:
         pass
 
-# ========== 3. MAIN UI ==========
+# ========== 4. MAIN UI (FULL DISPLAY MODE) ==========
 
 def main():
     os.system('cls' if os.name == 'nt' else 'clear')
     print(f"""
     ╔════════════════════════════════════════════════╗
-    ║     BITCOIN HUNTER - VISUAL MODE v7            ║
+    ║     BITCOIN HUNTER - FULL DISPLAY v8           ║
     ╚════════════════════════════════════════════════╝
     [+] Workers      : {NUM_PROCESSES}
-    [+] Batch Size   : {BATCH_SIZE}
-    [+] Display      : REAL-TIME MONITORING ACTIVE
+    [+] Mode         : FULL WIF DISPLAY (No Truncate)
     """)
     
     result_queue = Queue()
-    # Queue kecil untuk monitoring agar tidak membebani memori
     monitor_queue = Queue(maxsize=1) 
     counter = Value('i', 0)
     
@@ -179,33 +176,31 @@ def main():
         processes.append(p)
     
     start_time = time.time()
-    current_display_addr = "Initializing..."
-    current_display_wif = "..."
+    current_display_addr = "Init..."
+    current_display_wif = "Init..."
     
     try:
         while True:
-            # Update UI agak lambat (0.1s) agar terminal tidak flicker
-            time.sleep(0.1)
+            time.sleep(0.1) # Refresh rate
             
             elapsed = time.time() - start_time
             total = counter.value
             speed = total / elapsed if elapsed > 0 else 0
             
-            # Ambil data terbaru dari monitor_queue
             try:
-                # Kuras queue untuk dapat data paling baru
                 while not monitor_queue.empty():
                     current_display_addr, current_display_wif = monitor_queue.get_nowait()
             except:
                 pass
 
-            # Potong string agar muat di layar
+            # --- BAGIAN INI TIDAK DIPOTONG LAGI ---
+            # Kita tampilkan Address dan WIF secara penuh
             d_addr = current_display_addr
-            d_wif = current_display_wif[:35] + "..." if len(current_display_wif) > 35 else current_display_wif
-
-            # TAMPILAN STATUS BAR & DATA SCAN
-            # \033[K membersihkan sisa baris agar tidak ada teks tertinggal
-            status = f"\r[*] Scan: {total:,} | Spd: {speed:.0f}/s | CHECK: {d_addr} -> {d_wif} \033[K"
+            d_wif = current_display_wif 
+            
+            # Format output panjang
+            # \033[K membersihkan sisa baris
+            status = f"\r[*] Scan: {total:,} | {d_addr} -> {d_wif} \033[K"
             sys.stdout.write(status)
             sys.stdout.flush()
             
@@ -217,7 +212,7 @@ def main():
                        f"Private: {wif}\n"
                        f"Balance: {bal} Sats\n"
                        f"{'='*40}\n")
-                print(msg) # Print ini akan muncul di atas status bar
+                print(msg) 
                 with open(RICH_LOG_FILE, "a") as f:
                     f.write(f"ADDR: {addr} | WIF: {wif} | BAL: {bal}\n")
                     
